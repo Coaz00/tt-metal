@@ -7,6 +7,8 @@ from __future__ import annotations
 from types import NoneType
 from typing import TYPE_CHECKING, Any
 
+from loguru import logger
+
 import ttnn
 
 if TYPE_CHECKING:
@@ -39,18 +41,27 @@ class Tracer:
     ) -> Any:
         """Capture or execute trace.
 
-        On the first call, runs the wrapped function twice, once to compile, and once to capture the
-        trace. On subsequent calls, executes the captured trace.
+        On the first call, runs the wrapped function multiple times to capture the trace. On
+        subsequent calls, executes the captured trace. On the first call, inputs are used to
+        initialize the trace inputs. On subsequent calls, they are used to update the trace inputs.
+        Only `ttnn.Tensor` inputs can be changed. Aside from omitting positional inputs to reuse
+        previous values, a value of `None` can be passed to reuse the previous value for tensor
+        inputs as well.
+
+        Host tensor inputs will automatically be moved to the tracer device for the trace capture
+        and execution.
+
+        Executing a trace overwrites any device memory that was used during trace capture. In
+        particular, any device tensors that are allocated after the trace was captured may be
+        overwritten when the trace is executed, even if they are not inputs or outputs of the trace.
+        Host tensors will not be overwritten. Input tensors are copied before trace execution, so
+        they can safely be allocated on device if their content is not needed after trace execution.
 
         Args:
             tracer_cq_id: Command queue id.
             tracer_blocking_execution: Whether `ttnn.execute_trace` should block.
-            *args: Positional inputs to pass to the wrapped function. On the first call, these are
-                   used to initialize the trace inputs. On subsequent calls, these are used to
-                   update the trace inputs. Only tensor inputs can be changed.
-            **kwargs: Named inputs to pass to the wrapped function. On the first call, these are
-                      used to initialize the trace inputs. On subsequent calls, these are optional
-                      and used to update the trace inputs. Only tensor inputs can be changed.
+            *args: Positional inputs to pass to the wrapped function.
+            **kwargs: Named inputs to pass to the wrapped function. Optional on subsequent calls.
 
         Returns:
             The outputs of the wrapped function.
@@ -60,6 +71,10 @@ class Tracer:
             Any exception raised by the wrapped function during first invocation.
         """
         if self._trace_id is None:
+            if self._function is None:
+                msg = "tracer can not be reused after the trace was released"
+                raise RuntimeError(msg)
+
             args = _tree_map(_verify_value, args, path_label="args")
             kwargs = _tree_map(_verify_value, kwargs, path_label="kwargs")
             self._args = _tree_map(self._move_to_device_if_tensor, args, path_label="args")
@@ -70,6 +85,7 @@ class Tracer:
             self._function(*self._args, **self._kwargs)
 
             # capture trace
+            logger.debug("capturing trace...")
             trace_id = ttnn.begin_trace_capture(self._device, cq_id=tracer_cq_id)
             try:
                 try:
@@ -81,6 +97,10 @@ class Tracer:
             except Exception:
                 ttnn.release_trace(self._device, trace_id)
                 raise
+
+            # Allow resources referenced by the function to be freed, which might be used to offload
+            # weights.
+            self._function = None
 
             self._trace_id = trace_id
             self._outputs = outputs
@@ -99,7 +119,12 @@ class Tracer:
 
         return self._outputs
 
-    def release(self) -> None:
+    @property
+    def trace_ready(self) -> bool:
+        """Whether a trace has been captured and is ready for execution."""
+        return self._trace_id is not None
+
+    def release_trace(self) -> None:
         """Release the captured trace and clear inputs and outputs."""
         trace_id = self._trace_id
 
@@ -141,7 +166,9 @@ class Tracer:
                 if new.device() != prev.device():
                     msg = f"input '{path_label}' tensor device does not match the initial device"
                     raise ValueError(msg)
-                ttnn.copy(new, prev)
+
+                if new.buffer_address() != prev.buffer_address():
+                    ttnn.copy(new, prev)
 
         elif new != prev:
             msg = f"input '{path_label}' does not match the initial value"

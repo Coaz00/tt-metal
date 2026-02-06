@@ -16,14 +16,12 @@ from ...layers.module import Module, ModuleList, Parameter
 from ...layers.normalization import RMSNorm
 from ...parallel.config import VaeHWParallelConfig
 from ...parallel.manager import CCLManager
-from ...utils.conv3d import _ntuple, aligned_channels, count_convs, get_conv3d_config, prepare_conv3d_weights
+from ...utils.conv3d import _ntuple, aligned_channels, get_conv3d_config, prepare_conv3d_weights
 from ...utils.substate import pop_substate, rename_substate
 from ...utils.tensor import bf16_tensor
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
-
-CACHE_T = 2
+    from collections.abc import Iterable, Sequence
 
 
 def conv3d_to_linear_weight(state):
@@ -221,10 +219,18 @@ class WanCausalConv3d(Module):
         kernel_size: Sequence[int] | int,
         stride: Sequence[int] | int = 1,
         padding: Sequence[int] | int = 0,
+        cache_key: str = "",
         mesh_device: ttnn.MeshDevice,
         parallel_config: VaeHWParallelConfig,
         ccl_manager: CCLManager,
     ) -> None:
+        """Causal 3D convolution with temporal caching for autoregressive VAE inference.
+
+        Unlike in the diffusers implementation padding[0] is applied to the front only once. The
+        diffusers implementation applies 2 * padding[0] making it impossible to have odd padding.
+        The diffusers implementation works around this by moving the padding logic out of the module
+        in the odd case.
+        """
         super().__init__()
 
         self.unpadded_in_channels = in_channels
@@ -247,7 +253,7 @@ class WanCausalConv3d(Module):
         external_padding = list(padding)
         internal_padding = list(padding)
         # t padding is handled explicitly and depends on the cache.
-        external_padding[0] = 2 * padding[0]
+        external_padding[0] = padding[0]
         internal_padding[0] = 0
         # HW padding may be handled by the halo CCL if the model is parallelized
         if self.parallel_config.height_parallel.factor > 1:
@@ -279,6 +285,7 @@ class WanCausalConv3d(Module):
         self.bias = Parameter(total_shape=[1, self.out_channels], device=mesh_device, pad_value=0)
 
         self.mask_cache = {}
+        self._cache_key = cache_key
 
     def _prepare_torch_state(self, state: dict[str, torch.Tensor]) -> None:
         def maybe_pad_out_channels(weight, bias):
@@ -315,7 +322,7 @@ class WanCausalConv3d(Module):
         self,
         x_BTHWC: ttnn.Tensor,
         logical_h: int,
-        cache_x_BTHWC: ttnn.Tensor | None = None,
+        feat_cache: FeatureCache | None = None,
     ) -> ttnn.Tensor:
         """
         x_BTHWC: (B, T, H, W, C) fractured on H and W
@@ -325,6 +332,9 @@ class WanCausalConv3d(Module):
         """
         # NOTE: T padding is handled explicitly and depends on the cache
         t_front_padding = self.external_padding[0]
+        cache_x_BTHWC = (
+            feat_cache.update(self._cache_key, x_BTHWC, length=t_front_padding) if feat_cache is not None else None
+        )
         if cache_x_BTHWC is not None and t_front_padding > 0:
             # concat on T
             x_BTHWC = ttnn.concat([cache_x_BTHWC, x_BTHWC], dim=1)
@@ -341,7 +351,6 @@ class WanCausalConv3d(Module):
 
         # Height halo
         if self.external_padding[1] > 0 and self.parallel_config.height_parallel.factor > 1:
-            ttnn.synchronize_device(x_BTHWC.device())
             x_BTHWC = ttnn.experimental.neighbor_pad_async(
                 x_BTHWC,
                 dim=2,
@@ -359,13 +368,11 @@ class WanCausalConv3d(Module):
                 num_links=get_neighbor_pad_num_links(self.ccl_manager, x_BTHWC, 2),
                 topology=self.ccl_manager.topology,
             )
-            ttnn.synchronize_device(x_BTHWC.device())
 
         # Width halo
         if self.external_padding[2] > 0 and self.parallel_config.width_parallel.factor > 1:
             # TODO: Fix validation in neighbor_pad_async to allow halo on dim3
             x_THWC = ttnn.squeeze(x_BTHWC, dim=0)
-            ttnn.synchronize_device(x_THWC.device())
             x_THWC = ttnn.experimental.neighbor_pad_async(
                 x_THWC,
                 dim=2,
@@ -382,7 +389,6 @@ class WanCausalConv3d(Module):
                 # memory_config=mem_config_output,
                 topology=self.ccl_manager.topology,
             )
-            ttnn.synchronize_device(x_THWC.device())
             x_BTHWC = ttnn.unsqueeze(x_THWC, dim=0)
 
         x_BTHWC = ttnn.experimental.conv3d(
@@ -414,6 +420,7 @@ class WanResidualBlock(Module):
         *,
         in_dim: int,
         out_dim: int,
+        cache_key: str = "",
         mesh_device: ttnn.MeshDevice,
         parallel_config: VaeHWParallelConfig,
         ccl_manager: CCLManager,
@@ -435,7 +442,8 @@ class WanResidualBlock(Module):
             in_channels=in_dim,
             out_channels=out_dim,
             kernel_size=3,
-            padding=1,
+            padding=(2, 1, 1),
+            cache_key=f"{cache_key}.conv1",
             mesh_device=mesh_device,
             ccl_manager=ccl_manager,
             parallel_config=parallel_config,
@@ -451,7 +459,8 @@ class WanResidualBlock(Module):
             in_channels=out_dim,
             out_channels=out_dim,
             kernel_size=3,
-            padding=1,
+            padding=(2, 1, 1),
+            cache_key=f"{cache_key}.conv2",
             mesh_device=mesh_device,
             ccl_manager=ccl_manager,
             parallel_config=parallel_config,
@@ -496,8 +505,7 @@ class WanResidualBlock(Module):
         self,
         x_BTHWC: ttnn.Tensor,
         logical_h: int,
-        feat_cache: list[ttnn.Tensor] | None = None,
-        feat_idx: list[int] = [0],
+        feat_cache: FeatureCache | None = None,
     ) -> ttnn.Tensor:
         x_tile_BTHWC = ttnn.to_layout(x_BTHWC, ttnn.TILE_LAYOUT)
         h_tile_BTHWC = (
@@ -510,21 +518,7 @@ class WanResidualBlock(Module):
         x_BTHWC = ttnn.to_layout(x_silu_tile_BTHWC, ttnn.ROW_MAJOR_LAYOUT)
 
         # Cached conv
-        if feat_cache is not None:
-            # Prepare to cache the current activation for future use
-            idx = feat_idx[0]
-            t_start = x_BTHWC.shape[1] - CACHE_T
-            cache_x_BTHWC = x_BTHWC[:, t_start:, :, :, :]
-            if cache_x_BTHWC.shape[1] < 2 and feat_cache[idx] is not None:
-                # Current activation is too short, so append the cached activation as well
-                cache_x_BTHWC = ttnn.concat([feat_cache[idx][:, -1:, :, :, :], cache_x_BTHWC], dim=1)
-
-            x_conv_BTHWC = self.conv1(x_BTHWC, logical_h, feat_cache[idx])
-            # NOTE: Should deallocate feat_cache[idx] after it's reassigned
-            feat_cache[idx] = cache_x_BTHWC
-            feat_idx[0] += 1
-        else:
-            x_conv_BTHWC = self.conv1(x_BTHWC, logical_h)
+        x_conv_BTHWC = self.conv1(x_BTHWC, logical_h, feat_cache)
 
         x_tile_BTHWC = ttnn.to_layout(x_conv_BTHWC, ttnn.TILE_LAYOUT)
         x_norm_tile_BTHWC = self.norm2(x_tile_BTHWC, compute_kernel_config=self.hifi4_compute_kernel_config)
@@ -532,21 +526,7 @@ class WanResidualBlock(Module):
         x_BTHWC = ttnn.to_layout(x_silu_tile_BTHWC, ttnn.ROW_MAJOR_LAYOUT)
 
         # Cached conv
-        if feat_cache is not None:
-            # Prepare to cache the current activation for future use
-            idx = feat_idx[0]
-            t_start = x_BTHWC.shape[1] - CACHE_T
-            cache_x_BTHWC = x_BTHWC[:, t_start:, :, :, :]
-            if cache_x_BTHWC.shape[1] < 2 and feat_cache[idx] is not None:
-                # Current activation is too short, so append the cached activation as well
-                cache_x_BTHWC = ttnn.concat([feat_cache[idx][:, -1:, :, :, :], cache_x_BTHWC], dim=1)
-
-            x_conv_BTHWC = self.conv2(x_BTHWC, logical_h, feat_cache[idx])
-            # NOTE: Should deallocate feat_cache[idx] after it's reassigned
-            feat_cache[idx] = cache_x_BTHWC
-            feat_idx[0] += 1
-        else:
-            x_conv_BTHWC = self.conv2(x_BTHWC, logical_h)
+        x_conv_BTHWC = self.conv2(x_BTHWC, logical_h, feat_cache)
 
         # Add residual
         x_tile_BTHWC = ttnn.to_layout(x_conv_BTHWC, ttnn.TILE_LAYOUT)
@@ -561,6 +541,7 @@ class WanMidBlock(Module):
         *,
         dim: int,
         num_layers: int = 1,
+        cache_key: str = "",
         mesh_device: ttnn.MeshDevice,
         parallel_config: VaeHWParallelConfig,
         ccl_manager: CCLManager,
@@ -576,13 +557,14 @@ class WanMidBlock(Module):
             WanResidualBlock(
                 in_dim=dim,
                 out_dim=dim,
+                cache_key=f"{cache_key}.resnet0",
                 mesh_device=mesh_device,
                 ccl_manager=ccl_manager,
                 parallel_config=parallel_config,
             )
         )
 
-        for _ in range(num_layers):
+        for i in range(num_layers):
             attentions.append(
                 WanAttentionBlock(
                     dim=dim,
@@ -595,6 +577,7 @@ class WanMidBlock(Module):
                 WanResidualBlock(
                     in_dim=dim,
                     out_dim=dim,
+                    cache_key=f"{cache_key}.resnet{i + 1}",
                     mesh_device=mesh_device,
                     ccl_manager=ccl_manager,
                     parallel_config=parallel_config,
@@ -608,14 +591,13 @@ class WanMidBlock(Module):
         self,
         x_BTHWC: ttnn.Tensor,
         logical_h: int,
-        feat_cache: list[ttnn.Tensor] | None = None,
-        feat_idx: list[int] = [0],
+        feat_cache: FeatureCache | None = None,
     ) -> ttnn.Tensor:
-        x_res_BTHWC = self.resnets[0](x_BTHWC, logical_h, feat_cache, feat_idx)
+        x_res_BTHWC = self.resnets[0](x_BTHWC, logical_h, feat_cache)
         x_BTHWC = x_res_BTHWC
         for i in range(len(self.attentions)):
             x_attn_BTHWC = self.attentions[i](x_BTHWC, logical_h)
-            x_BTHWC = self.resnets[i + 1](x_attn_BTHWC, logical_h, feat_cache, feat_idx)
+            x_BTHWC = self.resnets[i + 1](x_attn_BTHWC, logical_h, feat_cache)
         return x_BTHWC
 
 
@@ -723,7 +705,6 @@ class WanConv2d(Module):
 
         # Height halo
         if self.external_padding[1] > 0 and self.parallel_config.height_parallel.factor > 1:
-            ttnn.synchronize_device(x_BTHWC.device())
             x_BTHWC = ttnn.experimental.neighbor_pad_async(
                 x_BTHWC,
                 dim=2,
@@ -742,12 +723,10 @@ class WanConv2d(Module):
                 # memory_config=mem_config_output,
                 topology=self.ccl_manager.topology,
             )
-            ttnn.synchronize_device(x_BTHWC.device())
         # Width halo
         if self.external_padding[2] > 0 and self.parallel_config.width_parallel.factor > 1:
             # TODO: Fix validation in neighbor_pad_async to allow halo on dim3
             x_THWC = ttnn.squeeze(x_BTHWC, dim=0)
-            ttnn.synchronize_device(x_THWC.device())
             x_THWC = ttnn.experimental.neighbor_pad_async(
                 x_THWC,
                 dim=2,
@@ -764,7 +743,6 @@ class WanConv2d(Module):
                 # memory_config=mem_config_output,
                 topology=self.ccl_manager.topology,
             )
-            ttnn.synchronize_device(x_THWC.device())
             x_BTHWC = ttnn.unsqueeze(x_THWC, dim=0)
 
         x_BTHWC = ttnn.experimental.conv3d(
@@ -797,6 +775,7 @@ class WanResample(Module):
         dim: int,
         mode: str,
         resample_out_dim: int | None = None,
+        cache_key: str = "",
         mesh_device: ttnn.MeshDevice,
         parallel_config: VaeHWParallelConfig,
         ccl_manager: CCLManager,
@@ -828,12 +807,15 @@ class WanResample(Module):
                 in_channels=dim,
                 out_channels=dim * 2 if self.is_upsample else dim,
                 kernel_size=(3, 1, 1),
-                padding=(1, 0, 0) if self.is_upsample else (0, 0, 0),
+                padding=(2, 0, 0) if self.is_upsample else (1, 0, 0),
                 stride=(1, 1, 1) if self.is_upsample else (2, 1, 1),
+                cache_key=cache_key,
                 mesh_device=mesh_device,
                 ccl_manager=ccl_manager,
                 parallel_config=parallel_config,
             )
+
+        self._time_conv_cache_key = cache_key
 
     def _prepare_torch_state(self, state: dict[str, torch.Tensor]) -> None:
         rename_substate(state, "resample.1", "conv")
@@ -842,40 +824,16 @@ class WanResample(Module):
         self,
         x_BTHWC,
         logical_h,
-        feat_cache: list[ttnn.Tensor] | None = None,
-        feat_idx: list[int] = [0],
+        feat_cache: FeatureCache | None = None,
     ) -> tuple[ttnn.Tensor, int]:
         B, T, H, W, C = x_BTHWC.shape
         if self.is_3d and self.is_upsample:  # upsample3d
             if feat_cache is not None:
-                idx = feat_idx[0]
-                if feat_cache[idx] is None:
-                    feat_cache[idx] = "Rep"
-                    feat_idx[0] += 1
+                if feat_cache.get(self._time_conv_cache_key) is None:
+                    feat_cache.update(self._time_conv_cache_key, ttnn.fill(x_BTHWC, 0.0), length=2)
                 else:
-                    t_start = x_BTHWC.shape[1] - CACHE_T
-                    cache_x_BTHWC = x_BTHWC[:, t_start:, :, :, :]
-                    is_rep = isinstance(feat_cache[idx], str) and feat_cache[idx] == "Rep"
-                    assert not (
-                        isinstance(feat_cache[idx], str) and not is_rep
-                    ), "If feat_cache[idx] is a string, it must be 'Rep'"
-                    if cache_x_BTHWC.shape[1] < 2 and feat_cache[idx] is not None and not is_rep:
-                        cache_x_BTHWC = ttnn.concat([feat_cache[idx][:, -1:, :, :, :], cache_x_BTHWC], dim=1)
-
-                    if cache_x_BTHWC.shape[1] < 2 and feat_cache[idx] is not None and is_rep:
-                        # When feat_cache[idx] is "Rep", we need to pad the cache_x_BTHWC with zeros
-                        # Padding only works on the lowest 3 dims
-                        cache_x_B1NC = ttnn.reshape(cache_x_BTHWC, (B, 1, H * W, C))
-                        cache_x_BTNC = ttnn.pad(cache_x_B1NC, [(0, 0), (1, 0), (0, 0), (0, 0)], value=0.0)
-                        cache_x_BTHWC = ttnn.reshape(cache_x_BTNC, (B, 2, H, W, C))
-
-                    if is_rep:
-                        x_time_BTHWU = self.time_conv(x_BTHWC, logical_h)
-                    else:
-                        x_time_BTHWU = self.time_conv(x_BTHWC, logical_h, feat_cache[idx])
+                    x_time_BTHWU = self.time_conv(x_BTHWC, logical_h, feat_cache)
                     x_BTHWU = x_time_BTHWU
-                    feat_cache[idx] = cache_x_BTHWC
-                    feat_idx[0] += 1
 
                     T1 = x_BTHWU.shape[1]
                     x_BTHW2C = ttnn.reshape(x_BTHWU, (B, T1, H, W, 2, C))
@@ -902,17 +860,10 @@ class WanResample(Module):
         # Handle downsample3d
         if self.is_3d and not self.is_upsample:  # downsample3d
             if feat_cache is not None:
-                idx = feat_idx[0]
-                if feat_cache[idx] is None:
-                    feat_cache[idx] = ttnn.clone(x_conv_BTHWC)
-                    feat_idx[0] += 1
+                if feat_cache.get(self._time_conv_cache_key) is None:
+                    feat_cache.update(self._time_conv_cache_key, ttnn.clone(x_conv_BTHWC), length=1)
                 else:
-                    cache_x_BTHWC = ttnn.clone(x_conv_BTHWC[:, -1:, :, :, :])
-                    x_conv_BTHWC = self.time_conv(
-                        ttnn.concat([feat_cache[idx][:, -1:, :, :, :], x_conv_BTHWC], dim=1), logical_h
-                    )
-                    feat_cache[idx] = cache_x_BTHWC
-                    feat_idx[0] += 1
+                    x_conv_BTHWC = self.time_conv.forward(x_conv_BTHWC, logical_h, feat_cache=feat_cache)
             else:
                 raise ValueError("feat_cache cannot be None")
         return x_conv_BTHWC, logical_h
@@ -926,6 +877,7 @@ class WanUpBlock(Module):
         out_dim: int,
         num_res_blocks: int,
         upsample_mode: str | None = None,
+        cache_key: str = "",
         mesh_device: ttnn.MeshDevice,
         parallel_config: VaeHWParallelConfig,
         ccl_manager: CCLManager,
@@ -944,11 +896,12 @@ class WanUpBlock(Module):
 
         resnets = ModuleList()
         current_dim = in_dim
-        for _ in range(num_res_blocks + 1):
+        for i in range(num_res_blocks + 1):
             resnets.append(
                 WanResidualBlock(
                     in_dim=current_dim,
                     out_dim=out_dim,
+                    cache_key=f"{cache_key}.resnet{i}",
                     mesh_device=mesh_device,
                     ccl_manager=ccl_manager,
                     parallel_config=parallel_config,
@@ -962,6 +915,7 @@ class WanUpBlock(Module):
             self.upsamplers = WanResample(
                 dim=out_dim,
                 mode=upsample_mode,
+                cache_key=f"{cache_key}.upsampler",
                 mesh_device=mesh_device,
                 ccl_manager=ccl_manager,
                 parallel_config=parallel_config,
@@ -974,14 +928,13 @@ class WanUpBlock(Module):
         self,
         x_BTHWC: ttnn.Tensor,
         logical_h: int,
-        feat_cache: list[ttnn.Tensor] | None = None,
-        feat_idx: list[int] = [0],
+        feat_cache: FeatureCache | None = None,
     ) -> tuple[ttnn.Tensor, int]:
         for resnet in self.resnets:
-            x_res_BTHWC = resnet(x_BTHWC, logical_h, feat_cache, feat_idx)
+            x_res_BTHWC = resnet(x_BTHWC, logical_h, feat_cache)
             x_BTHWC = x_res_BTHWC
         if self.upsamplers is not None:
-            x_upsampled_BTHWC, logical_h = self.upsamplers(x_BTHWC, logical_h, feat_cache, feat_idx)
+            x_upsampled_BTHWC, logical_h = self.upsamplers(x_BTHWC, logical_h, feat_cache)
             x_BTHWC = x_upsampled_BTHWC
         return x_BTHWC, logical_h
 
@@ -1023,7 +976,8 @@ class WanDecoder3d(Module):
             z_dim,
             dims[0],
             kernel_size=3,
-            padding=1,
+            padding=(2, 1, 1),
+            cache_key="conv_in",
             mesh_device=mesh_device,
             ccl_manager=ccl_manager,
             parallel_config=parallel_config,
@@ -1033,6 +987,7 @@ class WanDecoder3d(Module):
         self.mid_block = WanMidBlock(
             dim=dims[0],
             num_layers=1,
+            cache_key="mid_block",
             mesh_device=mesh_device,
             ccl_manager=ccl_manager,
             parallel_config=parallel_config,
@@ -1061,6 +1016,7 @@ class WanDecoder3d(Module):
                 out_dim=out_dim,
                 num_res_blocks=num_res_blocks,
                 upsample_mode=upsample_mode,
+                cache_key=f"up_block{i}",
                 mesh_device=mesh_device,
                 ccl_manager=ccl_manager,
                 parallel_config=parallel_config,
@@ -1079,7 +1035,8 @@ class WanDecoder3d(Module):
             out_dim,
             out_channels,
             kernel_size=3,
-            padding=1,
+            padding=(2, 1, 1),
+            cache_key="conv_out",
             mesh_device=mesh_device,
             ccl_manager=ccl_manager,
             parallel_config=parallel_config,
@@ -1093,33 +1050,19 @@ class WanDecoder3d(Module):
         self,
         x_BTHWC: ttnn.Tensor,
         logical_h: int,
-        feat_cache: list[ttnn.Tensor] | None = None,
-        feat_idx: list[int] = [0],
-        first_chunk: bool = False,
+        feat_cache: FeatureCache | None = None,
     ) -> tuple[ttnn.Tensor, int]:
-        # NOTE: first_chunk is not used. It would be needed for WanResidualUpBlock.
         ## conv1
-        if feat_cache is not None:
-            idx = feat_idx[0]
-            t_start = x_BTHWC.shape[1] - CACHE_T
-            cache_x_BTHWC = x_BTHWC[:, t_start:, :, :, :]
-            if cache_x_BTHWC.shape[1] < 2 and feat_cache[idx] is not None:
-                # Current activation is too short, so append the cached activation as well
-                cache_x_BTHWC = ttnn.concat([feat_cache[idx][:, -1:, :, :, :], cache_x_BTHWC], dim=1)
-            x_BTHWC = self.conv_in(x_BTHWC, logical_h, feat_cache[idx])
-            feat_cache[idx] = cache_x_BTHWC
-            feat_idx[0] += 1
-        else:
-            x_BTHWC = self.conv_in(x_BTHWC, logical_h)
+        x_BTHWC = self.conv_in(x_BTHWC, logical_h, feat_cache)
 
         ## middle
-        x_BTHWC = self.mid_block(x_BTHWC, logical_h, feat_cache, feat_idx)
+        x_BTHWC = self.mid_block(x_BTHWC, logical_h, feat_cache)
         # DEBUG
         # return x_BTHWC
 
         ## upsamples
         for up_block in self.up_blocks:
-            x_BTHWC, logical_h = up_block(x_BTHWC, logical_h, feat_cache, feat_idx)
+            x_BTHWC, logical_h = up_block(x_BTHWC, logical_h, feat_cache)
 
         ## head
         x_tile_BTHWC = ttnn.to_layout(x_BTHWC, ttnn.TILE_LAYOUT)
@@ -1127,18 +1070,8 @@ class WanDecoder3d(Module):
         x_silu_tile_BTHWC = ttnn.silu(x_norm_tile_BTHWC)
         x_BTHWC = ttnn.to_layout(x_silu_tile_BTHWC, ttnn.ROW_MAJOR_LAYOUT)
 
-        if feat_cache is not None:
-            idx = feat_idx[0]
-            t_start = x_BTHWC.shape[1] - CACHE_T
-            cache_x_BTHWC = x_BTHWC[:, t_start:, :, :, :]
-            if cache_x_BTHWC.shape[1] < 2 and feat_cache[idx] is not None:
-                # Current activation is too short, so append the cached activation as well
-                cache_x_BTHWC = ttnn.concat([feat_cache[idx][:, -1:, :, :, :], cache_x_BTHWC], dim=1)
-            x_BTHWC = self.conv_out(x_BTHWC, logical_h, feat_cache[idx])
-            feat_cache[idx] = cache_x_BTHWC
-            feat_idx[0] += 1
-        else:
-            x_BTHWC = self.conv_out(x_BTHWC, logical_h)
+        x_BTHWC = self.conv_out(x_BTHWC, logical_h, feat_cache)
+
         return x_BTHWC, logical_h
 
 
@@ -1229,8 +1162,6 @@ class WanDecoder(Module):
             parallel_config=parallel_config,
         )
 
-        self.cached_conv_count = count_convs(self.decoder)
-
     def _prepare_torch_state(self, state: dict[str, torch.Tensor]) -> None:
         if "post_quant_conv.weight" in state and "post_quant_conv.bias" in state:
             state_sub = conv3d_to_linear_weight(pop_substate(state, "post_quant_conv"))
@@ -1240,14 +1171,11 @@ class WanDecoder(Module):
         pop_substate(state, "encoder")
         pop_substate(state, "quant_conv")
 
-    def clear_cache(self):
-        self._conv_idx = [0]
-        self._feat_cache = [None] * self.cached_conv_count
-
     def forward(self, z_BTHWC: ttnn.Tensor, logical_h: int) -> tuple[ttnn.Tensor, int]:
         B, T, H, W, C = z_BTHWC.shape
 
-        self.clear_cache()
+        feat_cache = FeatureCache()
+
         z_tile_BTHWC = ttnn.to_layout(z_BTHWC, ttnn.TILE_LAYOUT)
         x_tile_BTHWC = self.post_quant_conv(z_tile_BTHWC)
         x_BTHWC = ttnn.to_layout(x_tile_BTHWC, ttnn.ROW_MAJOR_LAYOUT)
@@ -1255,10 +1183,7 @@ class WanDecoder(Module):
         output_BCTHW = None
         for i in range(T):
             # Process one frame at a time
-            self._conv_idx = [0]
-            out_BTHWC, new_logical_h = self.decoder(
-                x_BTHWC[:, i : i + 1, :, :, :], logical_h, feat_cache=self._feat_cache, feat_idx=self._conv_idx
-            )
+            out_BTHWC, new_logical_h = self.decoder(x_BTHWC[:, i : i + 1, :, :, :], logical_h, feat_cache=feat_cache)
             # Channels first
             out_BCTHW = ttnn.permute(out_BTHWC, (0, 4, 1, 2, 3))
             # Trim padding on output channels
@@ -1271,7 +1196,6 @@ class WanDecoder(Module):
         output_tile_BCTHW = ttnn.to_layout(output_BCTHW, ttnn.TILE_LAYOUT)
         output_BCTHW = ttnn.clamp(output_tile_BCTHW, min=-1.0, max=1.0)
         output_BCTHW = ttnn.to_layout(output_BCTHW, ttnn.ROW_MAJOR_LAYOUT)
-        self.clear_cache()
         return (output_BCTHW, new_logical_h)
 
 
@@ -1312,7 +1236,8 @@ class WanEncoder3D(Module):
             in_channels,
             dims[0],
             kernel_size=3,
-            padding=1,
+            padding=(2, 1, 1),
+            cache_key="conv_in",
             mesh_device=mesh_device,
             ccl_manager=ccl_manager,
             parallel_config=parallel_config,
@@ -1321,11 +1246,12 @@ class WanEncoder3D(Module):
         # downsample blocks.
         self.down_blocks = ModuleList()
         for i, (in_dim, out_dim) in enumerate(zip(dims[:-1], dims[1:])):
-            for _ in range(num_res_blocks):
+            for j in range(num_res_blocks):
                 self.down_blocks.append(
                     WanResidualBlock(
                         in_dim=in_dim,
                         out_dim=out_dim,
+                        cache_key=f"down{i}.resnet{j}",
                         mesh_device=mesh_device,
                         ccl_manager=ccl_manager,
                         parallel_config=parallel_config,
@@ -1349,6 +1275,7 @@ class WanEncoder3D(Module):
                     WanResample(
                         dim=out_dim,
                         mode=mode,
+                        cache_key=f"resample{i}",
                         mesh_device=mesh_device,
                         ccl_manager=ccl_manager,
                         parallel_config=parallel_config,
@@ -1358,7 +1285,12 @@ class WanEncoder3D(Module):
 
         # middle blocks
         self.mid_block = WanMidBlock(
-            dim=out_dim, num_layers=1, mesh_device=mesh_device, ccl_manager=ccl_manager, parallel_config=parallel_config
+            dim=out_dim,
+            num_layers=1,
+            cache_key="mid_block",
+            mesh_device=mesh_device,
+            ccl_manager=ccl_manager,
+            parallel_config=parallel_config,
         )
 
         # output blocks
@@ -1369,7 +1301,8 @@ class WanEncoder3D(Module):
             out_dim,
             z_dim,
             kernel_size=3,
-            padding=1,
+            padding=(2, 1, 1),
+            cache_key="conv_out",
             mesh_device=mesh_device,
             ccl_manager=ccl_manager,
             parallel_config=parallel_config,
@@ -1384,35 +1317,23 @@ class WanEncoder3D(Module):
         x_BTHWC: ttnn.Tensor,
         logical_h: int,
         feat_cache: list[ttnn.Tensor] | None = None,
-        feat_idx: list[int] = [0],
     ) -> tuple[ttnn.Tensor, int]:
         ## conv1
-        if feat_cache is not None:
-            idx = feat_idx[0]
-            t_start = x_BTHWC.shape[1] - CACHE_T
-            cache_x_BTHWC = x_BTHWC[:, t_start:, :, :, :]
-            if cache_x_BTHWC.shape[1] < 2 and feat_cache[idx] is not None:
-                # Current activation is too short, so append the cached activation as well
-                cache_x_BTHWC = ttnn.concat([feat_cache[idx][:, -1:, :, :, :], cache_x_BTHWC], dim=1)
-            x_BTHWC = self.conv_in(x_BTHWC, logical_h, feat_cache[idx])
-            feat_cache[idx] = cache_x_BTHWC
-            feat_idx[0] += 1
-        else:
-            x_BTHWC = self.conv_in(x_BTHWC, logical_h)
+        x_BTHWC = self.conv_in(x_BTHWC, logical_h, feat_cache)
 
         ## downsamples
         for down_block in self.down_blocks:
             if isinstance(down_block, WanResample):
-                x_BTHWC, logical_h = down_block(x_BTHWC, logical_h, feat_cache, feat_idx)
+                x_BTHWC, logical_h = down_block(x_BTHWC, logical_h, feat_cache)
             elif isinstance(down_block, WanResidualBlock):
-                x_BTHWC = down_block(x_BTHWC, logical_h, feat_cache, feat_idx)
+                x_BTHWC = down_block(x_BTHWC, logical_h, feat_cache)
             elif isinstance(down_block, WanAttentionBlock):
                 x_BTHWC = down_block(x_BTHWC, logical_h)
             else:
                 raise ValueError(f"Unsupported downblock type: {type(down_block)}")
 
         ## middle
-        x_BTHWC = self.mid_block(x_BTHWC, logical_h, feat_cache, feat_idx)
+        x_BTHWC = self.mid_block(x_BTHWC, logical_h, feat_cache)
 
         ## head
         x_tile_BTHWC = ttnn.to_layout(x_BTHWC, ttnn.TILE_LAYOUT)
@@ -1420,18 +1341,8 @@ class WanEncoder3D(Module):
         x_silu_tile_BTHWC = ttnn.silu(x_norm_tile_BTHWC)
         x_BTHWC = ttnn.to_layout(x_silu_tile_BTHWC, ttnn.ROW_MAJOR_LAYOUT)
 
-        if feat_cache is not None:
-            idx = feat_idx[0]
-            t_start = x_BTHWC.shape[1] - CACHE_T
-            cache_x_BTHWC = x_BTHWC[:, t_start:, :, :, :]
-            if cache_x_BTHWC.shape[1] < 2 and feat_cache[idx] is not None:
-                # Current activation is too short, so append the cached activation as well
-                cache_x_BTHWC = ttnn.concat([feat_cache[idx][:, -1:, :, :, :], cache_x_BTHWC], dim=1)
-            x_BTHWC = self.conv_out(x_BTHWC, logical_h, feat_cache[idx])
-            feat_cache[idx] = cache_x_BTHWC
-            feat_idx[0] += 1
-        else:
-            x_BTHWC = self.conv_out(x_BTHWC, logical_h)
+        x_BTHWC = self.conv_out(x_BTHWC, logical_h, feat_cache)
+
         return x_BTHWC, logical_h
 
 
@@ -1473,7 +1384,6 @@ class WanEncoder(Module):
             out_features=aligned_channels(self.out_channels),
             mesh_device=mesh_device,
         )
-        self.cached_conv_count = count_convs(self.encoder)
 
     def _prepare_torch_state(self, state: dict[str, torch.Tensor]) -> None:
         if "quant_conv.weight" in state and "quant_conv.bias" in state:
@@ -1484,28 +1394,21 @@ class WanEncoder(Module):
         pop_substate(state, "decoder")
         pop_substate(state, "post_quant_conv")
 
-    def clear_cache(self):
-        self._conv_idx = [0]
-        self._feat_cache = [None] * self.cached_conv_count
-
     def forward(self, x_BTHWC: ttnn.Tensor, logical_h: int) -> tuple[ttnn.Tensor, int]:
         B, T, H, W, C = x_BTHWC.shape
 
-        self.clear_cache()
+        feat_cache = FeatureCache()
 
         output_BTHWC = None
         T_encoded = 1 + (T - 1) // 4
         for i in range(T_encoded):
             # Process one frame at a time
-            self._conv_idx = [0]
             if i == 0:
                 x_BTHWC_chunk = x_BTHWC[:, :1, :, :, :]
             else:
                 x_BTHWC_chunk = x_BTHWC[:, 1 + 4 * (i - 1) : 1 + 4 * i, :, :, :]
 
-            out_BTHWC, new_logical_h = self.encoder(
-                x_BTHWC_chunk, logical_h, feat_cache=self._feat_cache, feat_idx=self._conv_idx
-            )
+            out_BTHWC, new_logical_h = self.encoder(x_BTHWC_chunk, logical_h, feat_cache=feat_cache)
 
             if output_BTHWC is None:
                 output_BTHWC = out_BTHWC
@@ -1519,7 +1422,6 @@ class WanEncoder(Module):
         output_BCTHW = ttnn.permute(output_BTHWC, (0, 4, 1, 2, 3))
         # Trim padding on output channels
         output_BCTHW = output_BCTHW[:, : self.z_dim, :, :, :]  # Get the mean
-        self.clear_cache()
         return (output_BCTHW, new_logical_h)
 
 
@@ -1531,3 +1433,47 @@ def get_neighbor_pad_num_links(ccl_manager, input_tensor, dim):
     for i in range(dim):
         upper_dims *= input_tensor.shape[i]
     return min(upper_dims, ccl_manager.num_links)
+
+
+class FeatureCache:
+    def __init__(self) -> None:
+        self._tensors: dict[str, ttnn.Tensor] = {}
+
+    def get(self, key: str) -> ttnn.Tensor | None:
+        return self._tensors.get(key)
+
+    def update(self, key: str, value: ttnn.Tensor, /, *, length: int) -> ttnn.Tensor | None:
+        _, t_size, _, _, _ = value.shape
+
+        cached = self._tensors.get(key)
+
+        diff = t_size - length
+        if diff > 0:
+            value = value[:, -length:]
+        elif diff < 0 and cached is not None:
+            # Current activation is too short, so append the cached activation as well
+            value = ttnn.concat([cached[:, diff:], value], dim=1)  # TODO
+        self._tensors[key] = value
+
+        return cached
+
+    def defrag(self) -> None:
+        device = None
+
+        for k, v in self._tensors.items():
+            if device is None:
+                device = v.device()
+
+            self._tensors[k] = v.cpu()
+            # tensors get deallocated by Python's reference counting mechanism
+
+        for k, v in self._tensors.items():
+            self._tensors[k] = ttnn.to_device(v, device)
+
+    @property
+    def features(self) -> Iterable[tuple[str, ttnn.Tensor]]:
+        """Returns an iterable of (key, tensor) pairs in the cache.
+
+        The order of the pairs is the order in which the tensors were added to the cache.
+        """
+        return self._tensors.items()

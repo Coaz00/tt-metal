@@ -357,17 +357,14 @@ def test_mochi_transformer_model(
     if load_cache:
         start = time.time()
 
-        try:
-            cache.load_model(
-                tt_model,
-                model_name="mochi-1-preview",
-                subfolder="transformer",
-                parallel_config=parallel_config,
-                mesh_shape=tuple(mesh_device.shape),
-            )
-        except cache.MissingCacheError as err:
-            msg = "Cache path does not exist. Run test_mochi_transformer_model_caching first with the desired parallel config."
-            raise RuntimeError(msg) from err
+        cache.load_model(
+            tt_model,
+            model_name="mochi-1-preview",
+            subfolder="transformer",
+            parallel_config=parallel_config,
+            mesh_shape=tuple(mesh_device.shape),
+            get_torch_state_dict=torch_model.state_dict,
+        )
 
         end = time.time()
         logger.info(f"Time taken to load cached state dict: {end - start} seconds")
@@ -381,7 +378,7 @@ def test_mochi_transformer_model(
     logger.info(
         f"Running TT model with spatial shape {spatial_input.shape}, prompt shape {prompt_input.shape}, timestep shape {timestep_input.shape}"
     )
-    tt_spatial_out = tt_model(
+    tt_spatial_out = tt_model.forward_full(
         spatial=spatial_input,
         prompt=prompt_input,
         timestep=timestep_input,
