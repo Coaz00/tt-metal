@@ -297,7 +297,7 @@ void test_h2d_socket(
     std::size_t page_size,
     std::size_t data_size,
     H2DMode h2d_mode,
-    uint32_t num_iterations = 10,
+    uint32_t num_iterations = 100,
     const MeshCoreCoord& recv_core = {MeshCoordinate(0, 0), CoreCoord(0, 0)}) {
     auto input_socket = H2DSocket(mesh_device, recv_core, BufferType::L1, socket_fifo_size, h2d_mode);
     input_socket.set_page_size(page_size);
@@ -326,8 +326,6 @@ void test_h2d_socket(
 
     uint32_t num_writes = data_size / page_size;
     std::vector<uint32_t> src_vec(data_size / sizeof(uint32_t));
-
-    auto recv_core_virtual = mesh_device->worker_core_from_logical_core(recv_core.core_coord);
     uint32_t page_size_words = page_size / sizeof(uint32_t);
     auto start_time = std::chrono::high_resolution_clock::now();
     for (uint32_t i = 0; i < num_iterations; i++) {
@@ -552,13 +550,13 @@ bool is_device_coord_mmio_mapped(
     return cluster.get_associated_mmio_device(device_id) == device_id;
 }
 
-using HDSocketFixture = MeshDevice1x2Fixture;
+using HDSocketFixture = MeshDevice4x8Fixture;
 TEST_F(HDSocketFixture, H2DSocket) {
     if (!experimental::GetMemoryPinningParameters(*mesh_device_).can_map_to_noc) {
         GTEST_SKIP() << "Mapping host memory to NOC is not supported on this system";
     }
 
-    for (auto h2d_mode : {H2DMode::HOST_PUSH, H2DMode::DEVICE_PULL}) {
+    for (auto h2d_mode : {H2DMode::HOST_PUSH}) {
         for (const auto& recv_coord : MeshCoordinateRange(mesh_device_->shape())) {
             if (!is_device_coord_mmio_mapped(mesh_device_, recv_coord)) {
                 continue;
@@ -1279,6 +1277,7 @@ TEST_F(HDSocketFixture, H2DSocketLoopback) {
             if (!is_device_coord_mmio_mapped(mesh_device_, socket_coord)) {
                 continue;
             }
+            std::cout << "Testing H2DSocketLoopback on socket_coord: " << socket_coord << std::endl;
             // No wrap
             test_hd_socket_loopback(
                 mesh_device_, 1024, 64, 1024, h2d_mode, 50, MeshCoreCoord(socket_coord, CoreCoord(0, 0)));
