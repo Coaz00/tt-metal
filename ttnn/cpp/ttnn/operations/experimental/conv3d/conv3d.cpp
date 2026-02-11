@@ -24,7 +24,7 @@ static Tensor prepare_and_check_weight_tensor(
         case 5:
             TT_FATAL(prepared_weight_tensor.device() == nullptr, "Unprepared weight tensor must be on host");
             prepared_weight_tensor = ttnn::operations::experimental::conv3d::prepare_weights(
-                prepared_weight_tensor, groups_, config.C_in_block, device);
+                prepared_weight_tensor, groups_, config.C_in_block, config.alignment, device);
             break;
         case 2: break;
         default: TT_THROW("Unsupported weight tensor rank: {}", prepared_weight_tensor.logical_shape().rank());

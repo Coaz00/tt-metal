@@ -139,10 +139,12 @@ Tensor convert_conv_weight_tensor_to_grouped_layout(
 }
 
 Tensor prepare_weights(
-    const ttnn::Tensor& weights, uint32_t groups, uint32_t C_in_block, MeshDevice* device, uint32_t alignment) {
+    const ttnn::Tensor& weights, uint32_t groups, uint32_t C_in_block, uint32_t alignment, MeshDevice* device) {
     ttnn::Tensor prepare_weights = weights;
 
-    prepare_weights = convert_conv_weight_tensor_to_grouped_layout(weights, groups, weights.dtype());
+    if (groups > 1) {
+        prepare_weights = convert_conv_weight_tensor_to_grouped_layout(weights, groups, weights.dtype());
+    }
     prepare_weights = ttnn::operations::core::to_device(prepare_weights, device, std::nullopt);
 
     ttnn::SmallVector<int64_t> dims_1 = {2, 3, 4, 1, 0};

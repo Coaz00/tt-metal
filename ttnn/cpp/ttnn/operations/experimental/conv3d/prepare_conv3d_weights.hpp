@@ -25,7 +25,7 @@ Tensor prepare_weights(
     const ttnn::Tensor& weights,
     uint32_t groups,
     uint32_t C_in_block = 0,
-    MeshDevice* device = nullptr,
-    uint32_t alignment = 32);
+    uint32_t alignment = 32,
+    MeshDevice* device = nullptr);
 
 }  // namespace ttnn::operations::experimental::conv3d
