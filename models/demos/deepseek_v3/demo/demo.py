@@ -122,6 +122,23 @@ def create_parser() -> argparse.ArgumentParser:
         help="Enable TTNN memory profiling dumps during setup",
     )
     p.add_argument(
+        "--mtp",
+        choices=["auto", "on", "off"],
+        default="auto",
+        help="Control MTP usage: auto (default), on (force enable), off (disable).",
+    )
+    p.add_argument(
+        "--min-mtp-accept-rate",
+        type=float,
+        default=None,
+        help="If set, require MTP accept rate to be at least this value.",
+    )
+    p.add_argument(
+        "--compare-output",
+        type=str,
+        help="Path to a baseline output JSON to compare against (text-only).",
+    )
+    p.add_argument(
         "--repeat-batches",
         type=int,
         default=1,
@@ -254,6 +271,8 @@ def run_demo(
     signpost: bool = False,
     prefill_max_tokens: int = None,
     force_recalculate: bool = False,
+    mtp: str = "auto",
+    min_mtp_accept_rate: float | None = None,
 ) -> dict:
     """Programmatic entrypoint for the DeepSeek-V3 demo.
 
@@ -353,6 +372,8 @@ def run_demo(
                 signpost=signpost,
                 prefill_max_tokens=prefill_max_tokens,
                 force_recalculate=force_recalculate,
+                mtp_mode=mtp,
+                min_mtp_accept_rate=min_mtp_accept_rate,
             )
         # Build the prompt list
         pre_tokenized_prompts = None
@@ -452,6 +473,8 @@ def main() -> None:
         enable_mem_profile=args.enable_mem_profile,
         signpost=args.signpost,
         prefill_max_tokens=args.prefill_max_tokens,
+        mtp=args.mtp,
+        min_mtp_accept_rate=args.min_mtp_accept_rate,
     )
 
     # If prompts were loaded from a JSON file, save output to JSON file instead of printing
@@ -524,6 +547,28 @@ def main() -> None:
 
     # Print performance metrics if available
     _print_performance_metrics(results)
+
+    if args.compare_output:
+        baseline_path = Path(args.compare_output)
+        if not baseline_path.exists():
+            raise SystemExit(f"Baseline output file does not exist: '{baseline_path}'")
+        try:
+            with open(baseline_path, "r", encoding="utf-8") as f:
+                baseline = json.load(f)
+        except Exception as e:
+            raise SystemExit(f"Failed to read baseline output '{baseline_path}': {e}")
+        baseline_generations = baseline.get("generations", [])
+        current_generations = results.get("generations", [])
+        if len(baseline_generations) != len(current_generations):
+            raise SystemExit(
+                f"Baseline generations count {len(baseline_generations)} does not match current {len(current_generations)}"
+            )
+        for i, (base_gen, cur_gen) in enumerate(zip(baseline_generations, current_generations)):
+            base_text = base_gen.get("text")
+            cur_text = cur_gen.get("text")
+            if base_text != cur_text:
+                raise SystemExit(f"Output mismatch at generation {i}: baseline and current text differ.")
+        logger.info("Output comparison passed: baseline and current generations match exactly.")
 
 
 if __name__ == "__main__":

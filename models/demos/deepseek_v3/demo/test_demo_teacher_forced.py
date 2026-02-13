@@ -29,6 +29,7 @@ CACHE_DIR = Path(
 REFERENCE_FILE = Path(__file__).with_name("deepseek_v3_teacher_forcing.refpt")
 
 
+@pytest.mark.timeout(3600)
 @pytest.mark.parametrize("reference_file", [REFERENCE_FILE])
 def test_demo_teacher_forcing_accuracy(reference_file: Path):
     """
