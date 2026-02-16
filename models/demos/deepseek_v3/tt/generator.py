@@ -998,7 +998,6 @@ class DeepseekGenerator:
                         if last_hidden is not None:
                             hidden_tail[i] = last_hidden
                     positions_tail = lengths.clone()
-                    positions_tail = torch.clamp(positions_tail - 1, min=0)
                     spec_logits = self._mtp_predict_logits(
                         hidden_states=hidden_tail,
                         tokens_step=next_tokens,
@@ -1142,6 +1141,59 @@ class DeepseekGenerator:
                                 total_verifies_alt += 1
                                 if int(pred_after_spec[i].item()) == int(spec_tokens[i].item()):
                                     total_accepts_alt += 1
+                            accepted_indices = torch.nonzero(accepted_prompt_mask).flatten().tolist()
+                            if accepted_indices:
+                                accepted_pos = {i: int(positions_before[i].item()) for i in accepted_indices}
+                                accepted_next = {i: int(pred_next[i].item()) for i in accepted_indices}
+                                accepted_spec = {i: int(spec_tokens[i].item()) for i in accepted_indices}
+                                accepted_next_text = {}
+                                accepted_spec_text = {}
+                                if self.tokenizer is not None:
+                                    for i in accepted_indices:
+                                        accepted_next_text[i] = repr(self.tokenizer.decode([accepted_next[i]]))
+                                        accepted_spec_text[i] = repr(self.tokenizer.decode([accepted_spec[i]]))
+                                logger.info(
+                                    "MTP accepts at step {}: idx={} pos={} pred_next={} spec={} pred_next_text={} spec_text={}".format(
+                                        decode_step_idx - 1,
+                                        accepted_indices,
+                                        accepted_pos,
+                                        accepted_next,
+                                        accepted_spec,
+                                        accepted_next_text if self.tokenizer is not None else "n/a",
+                                        accepted_spec_text if self.tokenizer is not None else "n/a",
+                                    )
+                                )
+                            rejected_indices = [
+                                i
+                                for i in range(num_of_prompts)
+                                if (not accepted_prompt_mask[i]) and generated_counts[i] < max_new_tokens
+                            ]
+                            if rejected_indices:
+                                rejected_pos = {i: int(positions_before[i].item()) for i in rejected_indices}
+                                rejected_next = {i: int(pred_next[i].item()) for i in rejected_indices}
+                                rejected_spec = {i: int(spec_tokens[i].item()) for i in rejected_indices}
+                                rejected_after = {i: int(pred_after_spec[i].item()) for i in rejected_indices}
+                                rejected_next_text = {}
+                                rejected_spec_text = {}
+                                rejected_after_text = {}
+                                if self.tokenizer is not None:
+                                    for i in rejected_indices:
+                                        rejected_next_text[i] = repr(self.tokenizer.decode([rejected_next[i]]))
+                                        rejected_spec_text[i] = repr(self.tokenizer.decode([rejected_spec[i]]))
+                                        rejected_after_text[i] = repr(self.tokenizer.decode([rejected_after[i]]))
+                                logger.info(
+                                    "MTP rejects at step {}: idx={} pos={} pred_next={} spec={} pred_after_spec={} pred_next_text={} spec_text={} pred_after_text={}".format(
+                                        decode_step_idx - 1,
+                                        rejected_indices,
+                                        rejected_pos,
+                                        rejected_next,
+                                        rejected_spec,
+                                        rejected_after,
+                                        rejected_next_text if self.tokenizer is not None else "n/a",
+                                        rejected_spec_text if self.tokenizer is not None else "n/a",
+                                        rejected_after_text if self.tokenizer is not None else "n/a",
+                                    )
+                                )
 
                         # Keep non-prompt lanes advancing to preserve tensor shapes.
                         for i in range(num_of_prompts, num_of_users):
@@ -1150,11 +1202,12 @@ class DeepseekGenerator:
 
                         tokens_for_spec = next_tokens.clone()
                         positions_for_spec = positions.clone()
+                        # For MTP: hidden[t] + token[t+1] -> predict token[t+2]
                         tokens_for_spec[:num_of_prompts] = pred_next
-                        positions_for_spec[:num_of_prompts] = positions_before[:num_of_prompts]
+                        positions_for_spec[:num_of_prompts] = positions_before[:num_of_prompts] + 1
                         tokens_for_spec[verify_offset : verify_offset + num_of_prompts] = pred_after_spec
                         positions_for_spec[verify_offset : verify_offset + num_of_prompts] = (
-                            positions_before[:num_of_prompts] + 1
+                            positions_before[:num_of_prompts] + 2
                         )
                         spec_logits_full = self._mtp_predict_logits(
                             hidden_states=hidden_2b_tt,
@@ -1388,50 +1441,76 @@ class DeepseekGenerator:
             # Prime MTP cache for this user using prompt tokens.
             mtp_page_table = self._get_mtp_page_table()
             full_seq_len = int(hidden_tt.shape[2])
-            if full_seq_len > 0:
-                # MTP prefill requires the shifted token length to be divisible by the reduce_scatter ring size.
-                # Use the full padded prompt length (aligned in _pad_batch) and append one pad token so
-                # token[t+1] aligns with hidden[t] across the entire padded span.
-                hidden_shifted = ttnn.slice(hidden_tt, [0, 0, 0, 0], [1, 1, full_seq_len, hidden_tt.shape[3]])
+            if full_seq_len > 0 and prompt_len is not None and prompt_len > 1:
+                # MTP prefill needs token[t+1] with hidden[t]. Pad only after the last real shifted token.
+                actual_len = min(int(prompt_len), full_seq_len)
+                shifted_len = max(actual_len - 1, 0)
+                if shifted_len > 0:
+                    # Use the local seq length from hidden_tt to stay consistent with sharded prefill output.
+                    aligned_len = int(full_seq_len)
+                    shifted_len = min(shifted_len, aligned_len)
+                    # Shift hidden/tokens by one position so token[t+1] is stored at cache position t+1.
+                    pad_id = self._get_pad_id()
+                    if aligned_len > 1:
+                        hidden_body = ttnn.slice(hidden_tt, [0, 0, 0, 0], [1, 1, aligned_len - 1, hidden_tt.shape[3]])
+                        hidden_first = ttnn.slice(hidden_tt, [0, 0, 0, 0], [1, 1, 1, hidden_tt.shape[3]])
+                        dummy_hidden = ttnn.mul(
+                            hidden_first,
+                            0.0,
+                            memory_config=hidden_first.memory_config(),
+                        )
+                        hidden_shifted = ttnn.concat(
+                            [dummy_hidden, hidden_body], dim=2, memory_config=ttnn.DRAM_MEMORY_CONFIG
+                        )
+                        ttnn.deallocate(hidden_first)
+                        ttnn.deallocate(dummy_hidden)
+                        ttnn.deallocate(hidden_body)
+                    else:
+                        hidden_shifted = ttnn.slice(hidden_tt, [0, 0, 0, 0], [1, 1, aligned_len, hidden_tt.shape[3]])
 
-                pad_id = self._get_pad_id()
-                tokens_host = tokens[:, :, :full_seq_len]
-                pad_token = torch.full((1, 1, 1), pad_id, dtype=tokens_host.dtype)
-                tokens_host_ext = torch.cat([tokens_host, pad_token], dim=-1)
-                tokens_shifted_host = tokens_host_ext[:, :, 1:]
-                tokens_shifted = ttnn.from_torch(
-                    tokens_shifted_host,
-                    device=self.mesh_device,
-                    mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh_device),
-                    dtype=ttnn.uint32,
-                    memory_config=ttnn.DRAM_MEMORY_CONFIG,
-                    layout=ttnn.ROW_MAJOR_LAYOUT,
-                )
+                    tokens_shifted_host = torch.full((1, 1, aligned_len), pad_id, dtype=tokens.dtype)
+                    if shifted_len > 0:
+                        tokens_shifted_host[:, :, 1 : shifted_len + 1] = tokens[:, :, 1:actual_len]
+                    tokens_shifted = ttnn.from_torch(
+                        tokens_shifted_host,
+                        device=self.mesh_device,
+                        mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh_device),
+                        dtype=ttnn.uint32,
+                        memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                        layout=ttnn.ROW_MAJOR_LAYOUT,
+                    )
 
-                # Slice RoPE to match the shifted sequence length (positions 0..full_seq_len-1).
-                cos_matrix = rope_tensors["cos_matrix"]
-                sin_matrix = rope_tensors["sin_matrix"]
-                cos_trim = ttnn.slice(cos_matrix, [0, 0, 0, 0], [1, 1, full_seq_len, cos_matrix.shape[3]])
-                sin_trim = ttnn.slice(sin_matrix, [0, 0, 0, 0], [1, 1, full_seq_len, sin_matrix.shape[3]])
-                mtp_rope_tensors = {
-                    "cos_matrix": cos_trim,
-                    "sin_matrix": sin_trim,
-                    "trans_matrix": rope_tensors["trans_matrix"],
-                }
+                    # Use RoPE positions offset by +1 for token[t+1].
+                    rope_setup_mtp = RotarySetup(
+                        device=self.mesh_device,
+                        batch_size_per_row=1,
+                        hf_config=self.hf_config,
+                    )
+                    mtp_rot_mats = rope_setup_mtp.get_rot_mats_table(aligned_len + 1)
+                    cos_matrix = mtp_rot_mats["cos_matrix"]
+                    sin_matrix = mtp_rot_mats["sin_matrix"]
+                    cos_trim = ttnn.slice(cos_matrix, [0, 0, 1, 0], [1, 1, aligned_len + 1, cos_matrix.shape[3]])
+                    sin_trim = ttnn.slice(sin_matrix, [0, 0, 1, 0], [1, 1, aligned_len + 1, sin_matrix.shape[3]])
+                    mtp_rope_tensors = {
+                        "cos_matrix": cos_trim,
+                        "sin_matrix": sin_trim,
+                        "trans_matrix": mtp_rot_mats["trans_matrix"],
+                    }
 
-                mtp_logits_tt = RowBatchedModel.forward_mtp_prefill(
-                    hidden_states=hidden_shifted,
-                    token_ids=tokens_shifted,
-                    user_id=user_id,
-                    cfg=self.model_run_config_prefill,
-                    rope_tensors=mtp_rope_tensors,
-                    page_table=mtp_page_table,
-                )
-                ttnn.deallocate(tokens_shifted)
-                ttnn.deallocate(cos_trim)
-                ttnn.deallocate(sin_trim)
-                ttnn.deallocate(mtp_logits_tt)
-                self.ccl.reset_sem_counters()
+                    mtp_logits_tt = RowBatchedModel.forward_mtp_prefill(
+                        hidden_states=hidden_shifted,
+                        token_ids=tokens_shifted,
+                        user_id=user_id,
+                        cfg=self.model_run_config_prefill,
+                        rope_tensors=mtp_rope_tensors,
+                        page_table=mtp_page_table,
+                    )
+                    ttnn.deallocate(hidden_shifted)
+                    ttnn.deallocate(tokens_shifted)
+                    ttnn.deallocate(cos_trim)
+                    ttnn.deallocate(sin_trim)
+                    ttnn.deallocate(mtp_logits_tt)
+                    self.ccl.reset_sem_counters()
 
             if return_last_hidden:
                 if prompt_len is None:

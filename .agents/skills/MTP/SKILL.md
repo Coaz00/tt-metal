@@ -52,6 +52,9 @@ description: Bring up multi-token prediction (speculative decoding) for TTNN tra
   - Avoid mis-sharded inputs.
   - Build shifted tokens on host with identical mesh replication.
   - Ensure the MTP prefill seq_len is padded to the mesh ring size (see above).
+- `TT_FATAL ND sharding requires number of chunks`:
+  - Avoid creating MTP dummy tensors with a different sharding scheme.
+  - Prefer deriving dummy tensors from slices of `hidden_tt` (same sharding) and zeroing via `ttnn.mul(..., 0.0)`.
 - Low acceptance:
   - Fix decode position alignment.
   - Fix concat ordering.
