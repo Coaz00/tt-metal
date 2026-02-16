@@ -1427,7 +1427,6 @@ class DeepseekGenerator:
                     rope_tensors=mtp_rope_tensors,
                     page_table=mtp_page_table,
                 )
-                ttnn.deallocate(hidden_shifted)
                 ttnn.deallocate(tokens_shifted)
                 ttnn.deallocate(cos_trim)
                 ttnn.deallocate(sin_trim)
@@ -1441,7 +1440,9 @@ class DeepseekGenerator:
                     last_hidden = torch.zeros((self.hf_config.hidden_size,), dtype=torch.bfloat16)
                 else:
                     hidden_idx = min(prompt_len - 1, full_seq_len - 1)
-                    hidden_slice = ttnn.slice(hidden_tt, [0, 0, hidden_idx, 0], [1, 1, 1, hidden_tt.shape[3]])
+                    hidden_slice = ttnn.slice(
+                        hidden_tt, [0, 0, hidden_idx, 0], [1, 1, hidden_idx + 1, hidden_tt.shape[3]]
+                    )
                     last_hidden = ttnn.to_torch(
                         hidden_slice,
                         mesh_composer=ttnn.ConcatMesh2dToTensor(
@@ -1449,6 +1450,9 @@ class DeepseekGenerator:
                         ),
                     )
                     last_hidden = last_hidden.squeeze(0).squeeze(0).squeeze(0)
+                    if last_hidden.dim() == 2 and last_hidden.shape[-1] == self.hf_config.hidden_size:
+                        # Some mesh composers leave an extra mesh-row dimension; take the first row.
+                        last_hidden = last_hidden[0]
                     ttnn.deallocate(hidden_slice)
 
             ttnn.deallocate(hidden_tt)

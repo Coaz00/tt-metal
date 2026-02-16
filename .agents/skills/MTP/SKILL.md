@@ -27,6 +27,7 @@ description: Bring up multi-token prediction (speculative decoding) for TTNN tra
   - Trim RoPE `cos/sin` to `seq_len-1` (do not shift; just slice)
 - Avoid padding the tail token/hidden. Padding biases acceptance and can hide alignment bugs.
 - Build shifted tokens on host if TTNN concat/shard causes CCL reduce_scatter failures.
+- For multi-device reduce_scatter, the MTP prefill sequence length must be divisible by the ring size. Use the padded `full_seq_len` from `_pad_batch` for MTP prefill, then trim after all_gather.
 
 ## Align Decode Positions
 - Align MTP decode positions to the token being predicted.
@@ -44,11 +45,13 @@ description: Bring up multi-token prediction (speculative decoding) for TTNN tra
 - Run full-model MTP (greedy) and require exact output match with baseline.
 - Track accept rate (target ~0.8; investigate if <0.5).
 - Do not enable MTP for teacher-forcing accuracy; compare baseline vs MTP outputs instead.
+- MTP cannot be forced when using `--override-num-layers` (no MTP layer in truncated configs). Use full model for MTP verification.
 
 ## Watch For Common Failures
 - `TT_FATAL reduce_scatter ring_size` in MTP prefill:
   - Avoid mis-sharded inputs.
   - Build shifted tokens on host with identical mesh replication.
+  - Ensure the MTP prefill seq_len is padded to the mesh ring size (see above).
 - Low acceptance:
   - Fix decode position alignment.
   - Fix concat ordering.

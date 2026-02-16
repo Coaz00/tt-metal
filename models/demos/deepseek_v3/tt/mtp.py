@@ -265,10 +265,21 @@ class MTP2D(AbstractModule):
         )
         ttnn.deallocate(token_norm)
 
+        orig_hidden_full = hidden_full
+        orig_token_full = token_full
+        if hidden_full.shape[2] != token_full.shape[2]:
+            min_len = min(hidden_full.shape[2], token_full.shape[2])
+            hidden_full = ttnn.slice(hidden_full, [0, 0, 0, 0], [1, 1, min_len, hidden_full.shape[3]])
+            token_full = ttnn.slice(token_full, [0, 0, 0, 0], [1, 1, min_len, token_full.shape[3]])
+
         # Concatenate token embedding then hidden.
         concat_in = ttnn.concat([token_full, hidden_full], **cfg["concat"])
         ttnn.deallocate(hidden_full)
         ttnn.deallocate(token_full)
+        if orig_hidden_full is not hidden_full:
+            ttnn.deallocate(orig_hidden_full)
+        if orig_token_full is not token_full:
+            ttnn.deallocate(orig_token_full)
 
         eh_out = ttnn.linear(concat_in, **cfg["eh_proj"]["linear"])
         ttnn.deallocate(concat_in)
@@ -331,10 +342,21 @@ class MTP2D(AbstractModule):
         )
         ttnn.deallocate(token_norm)
 
+        orig_hidden_full = hidden_full
+        orig_token_full = token_full
+        if hidden_full.shape[2] != token_full.shape[2]:
+            min_len = min(hidden_full.shape[2], token_full.shape[2])
+            hidden_full = ttnn.slice(hidden_full, [0, 0, 0, 0], [1, 1, min_len, hidden_full.shape[3]])
+            token_full = ttnn.slice(token_full, [0, 0, 0, 0], [1, 1, min_len, token_full.shape[3]])
+
         # Concatenate token embedding then hidden.
         concat_in = ttnn.concat([token_full, hidden_full], **cfg["concat"])
         ttnn.deallocate(hidden_full)
         ttnn.deallocate(token_full)
+        if orig_hidden_full is not hidden_full:
+            ttnn.deallocate(orig_hidden_full)
+        if orig_token_full is not token_full:
+            ttnn.deallocate(orig_token_full)
 
         eh_out = ttnn.linear(concat_in, **cfg["eh_proj"]["linear"])
         ttnn.deallocate(concat_in)

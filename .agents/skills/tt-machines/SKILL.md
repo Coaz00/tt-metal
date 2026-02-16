@@ -13,9 +13,9 @@ description: Operate Tenstorrent machines for TTNN workloads, including environm
 
 ## Reset When Needed
 - Reset on hangs, TLB allocation errors, or device stuck states:
-  - `/home/jrock/wa/scripts/reset-34`
+  - `/home/shared/scripts/reset.sh`
 - Ensure `TT_METAL_HOME` is set before resetting.
-- After `reset-34` completes successfully, wait 30 seconds before launching the next command.
+- After `reset` completes successfully, wait 30 seconds before launching the next command.
 
 ## Recover From Common Errors
 - `TT_FATAL` or CCL ring errors:
@@ -25,7 +25,7 @@ description: Operate Tenstorrent machines for TTNN workloads, including environm
   - Reset.
   - Avoid concurrent large jobs on the same mesh.
 - Missing environment:
-  - Export `TT_METAL_HOME` before running `ds-run-34` or reset scripts.
+  - Export `TT_METAL_HOME` before running `ds-run` or reset scripts.
 
 ## Run Workflow
 1. Source setup and activate venv.
@@ -38,6 +38,6 @@ description: Operate Tenstorrent machines for TTNN workloads, including environm
 - Use reasonable timeouts (10-30 min) for long runs and reset on hangs.
 
 ## Reference Commands
-- Demo run: `/home/jrock/wa/scripts/ds-run-34 python ...`
-- Accuracy check: `/home/jrock/wa/scripts/ds-run-34 pytest ...`
-- Reset: `/home/jrock/wa/scripts/reset-34`
+- Demo run: `/home/shared/scripts/ds-run python ...`
+- Accuracy check: `/home/shared/scripts/ds-run pytest ...`
+- Reset: `/home/shared/scripts/reset.sh`
