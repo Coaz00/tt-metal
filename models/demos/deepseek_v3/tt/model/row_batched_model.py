@@ -261,11 +261,13 @@ class RowBatchedModel(SharedStateAddOn, AbstractModule):
         ):
             x = BlockClass.forward_decode(x, position_idxs, block_cfg, rope_tensors, page_table)
 
+        # Capture pre-norm hidden states for MTP; MTP applies its own hnorm.
+        hidden_for_mtp = x if return_hidden else None
+
         x = ttnn.to_memory_config(x, **cfg["norm_reshard"])
         x = DistributedRMSNorm.forward_decode(x, cfg["norm"])
 
         ccl = cfg["lm_head"]["ccl"]
-        hidden_for_mtp = x if return_hidden else None
 
         x = ttnn.experimental.all_gather_async(x, **ccl.populate_all_gather_runtime_args(cfg["lm_head"]["all_gather"]))
         if return_hidden:
@@ -300,10 +302,12 @@ class RowBatchedModel(SharedStateAddOn, AbstractModule):
         ):
             x = BlockClass.forward_prefill(x, user_id, block_cfg, rope_tensors, page_table)
 
+        # Capture pre-norm hidden states for MTP; MTP applies its own hnorm.
+        hidden_for_mtp = x if return_hidden else None
+
         x = DistributedRMSNorm.forward_prefill(x, cfg["norm"])  # no resharding needed for prefill
 
         ccl = cfg["lm_head"]["ccl"]
-        hidden_for_mtp = x if return_hidden else None
 
         x = ttnn.experimental.all_gather_async(x, **ccl.populate_all_gather_runtime_args(cfg["lm_head"]["all_gather"]))
         if return_hidden:
@@ -329,6 +333,26 @@ class RowBatchedModel(SharedStateAddOn, AbstractModule):
             hidden_states=hidden_states,
             token_ids=token_ids,
             position_idxs=position_idxs,
+            cfg=cfg["mtp"],
+            rope_tensors=rope_tensors,
+            page_table=page_table,
+        )
+
+    @classmethod
+    def forward_mtp_prefill(
+        cls,
+        hidden_states: ttnn.Tensor,
+        token_ids: ttnn.Tensor,
+        user_id: int,
+        cfg: RunPrefillConfig,
+        rope_tensors: dict,
+        page_table: ttnn.Tensor,
+    ) -> ttnn.Tensor:
+        assert "mtp" in cfg, "MTP config is missing from prefill run config"
+        return MTP2D.forward_prefill(
+            hidden_states=hidden_states,
+            token_ids=token_ids,
+            user_id=user_id,
             cfg=cfg["mtp"],
             rope_tensors=rope_tensors,
             page_table=page_table,

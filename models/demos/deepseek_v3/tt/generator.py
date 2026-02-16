@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, List, Tuple
@@ -369,14 +370,15 @@ class DeepseekGenerator:
         with locked_file(config_path, "r", exclusive=False) as f:
             base_weight_cfg = json.load(f, object_hook=try_decode_saved_weight)
 
-        mtp_state_dict = self._load_mtp_layer_state_dict(skip_tied_weights=True)
+        use_tied_weights = bool(getattr(self.hf_config, "tie_word_embeddings", False))
+        mtp_state_dict = self._load_mtp_layer_state_dict(skip_tied_weights=use_tied_weights)
         mtp_weight_cfg = MTP2D.convert_weights(
             hf_config=self.hf_config,
             state_dicts=(mtp_state_dict,),
             output_path=cache_leaf / "mtp",
             mesh_device=self.mesh_device,
-            reuse_embedding_weight_cfg=base_weight_cfg.get("embedding"),
-            reuse_head_weight_cfg=base_weight_cfg.get("lm_head"),
+            reuse_embedding_weight_cfg=base_weight_cfg.get("embedding") if use_tied_weights else None,
+            reuse_head_weight_cfg=base_weight_cfg.get("lm_head") if use_tied_weights else None,
         )
 
         base_weight_cfg["mtp"] = mtp_weight_cfg
@@ -814,20 +816,7 @@ class DeepseekGenerator:
     def _sample_greedy(self, logits: torch.Tensor) -> torch.Tensor:
         return torch.argmax(logits, dim=-1)  # [B]
 
-    def _pad_batch(self, tokens_list: List[List[int]], batch_size: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Pad/pack a list of token id sequences to batch of size batch_size.
-
-        Returns
-            tokens_packed: torch.LongTensor [batch_size, S]
-            lengths: torch.IntTensor [batch_size] with actual sequence lengths for first N sequences, zeros otherwise
-        """
-        assert len(tokens_list) > 0 and len(tokens_list) <= batch_size
-        max_len = max(len(t) for t in tokens_list)
-        if self.prefill_max_tokens is not None:
-            max_len = min(self.prefill_max_tokens, max_len)  # truncate all sequences to the prefill_max_tokens
-        # Round up to nearest multiple of TILE_SIZE
-        max_len = ((max_len + ttnn.TILE_SIZE - 1) // ttnn.TILE_SIZE) * ttnn.TILE_SIZE
-
+    def _get_pad_id(self) -> int:
         pad_id = 0
         if self.tokenizer is not None:
             pad_id = getattr(self.tokenizer, "pad_token_id", None)
@@ -840,6 +829,25 @@ class DeepseekGenerator:
                         eos_id = eos_id[0] if eos_id else None
                 pad_id = eos_id if eos_id is not None else 0
             pad_id = int(pad_id)
+        return int(pad_id)
+
+    def _pad_batch(self, tokens_list: List[List[int]], batch_size: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Pad/pack a list of token id sequences to batch of size batch_size.
+
+        Returns
+            tokens_packed: torch.LongTensor [batch_size, S]
+            lengths: torch.IntTensor [batch_size] with actual sequence lengths for first N sequences, zeros otherwise
+        """
+        assert len(tokens_list) > 0 and len(tokens_list) <= batch_size
+        max_len = max(len(t) for t in tokens_list)
+        if self.prefill_max_tokens is not None:
+            max_len = min(self.prefill_max_tokens, max_len)  # truncate all sequences to the prefill_max_tokens
+        # Round up to nearest multiple of TILE_SIZE * mesh_axis to satisfy reduce_scatter constraints.
+        ring_size = int(self.mesh_device.shape[0])
+        alignment = ttnn.TILE_SIZE * max(ring_size, 1)
+        max_len = ((max_len + alignment - 1) // alignment) * alignment
+
+        pad_id = self._get_pad_id()
 
         out = torch.full((batch_size, max_len), pad_id, dtype=torch.long)
         lengths = torch.zeros((batch_size,), dtype=torch.int32)
@@ -903,6 +911,14 @@ class DeepseekGenerator:
 
         logger.info(f"Lengths of {lengths.shape} (encoded) prompts: {lengths}")
         decode_steps_for_stats = 0
+        num_of_users = tokens_batched.shape[0]
+        use_mtp_path = self.enable_mtp and teacher_forcing is None and (not self.enable_trace) and max_new_tokens > 1
+        if use_mtp_path and 2 * num_of_prompts > num_of_users:
+            logger.warning(
+                f"MTP verify batching needs 2x prompt lanes ({2 * num_of_prompts}) but only {num_of_users} are available; "
+                "falling back to regular decode path."
+            )
+            use_mtp_path = False
 
         # Run one or more prefill+decode batches
         for _ in range(repeat_batches):
@@ -914,8 +930,8 @@ class DeepseekGenerator:
             if self.signpost:
                 signpost(header="prefill")
             profiler.start("inference_prefill")
-            num_of_users = tokens_batched.shape[0]
             last_logits = []
+            prefill_last_hidden = [None] * num_of_users if use_mtp_path else None
             for user_id in range(num_of_users):
                 if lengths[user_id] == 0:
                     logger.info(f"Skipping prefill for user_id: {user_id} as prompt length is 0")
@@ -934,7 +950,16 @@ class DeepseekGenerator:
                         else str(tokens_batched[user_id][:prompt_len].tolist())
                     )
                 )
-                user_out = self._prefill(tokens_batched[user_id], user_id=user_id)
+                if use_mtp_path:
+                    user_out, last_hidden = self._prefill(
+                        tokens_batched[user_id],
+                        user_id=user_id,
+                        prompt_len=prompt_len,
+                        return_last_hidden=True,
+                    )
+                    prefill_last_hidden[user_id] = last_hidden
+                else:
+                    user_out = self._prefill(tokens_batched[user_id], user_id=user_id)
                 # Use logits at the *actual* last prompt token (not the padded tail).
                 last_logits.append(user_out[0, 0, prompt_len - 1, :])
                 self.ccl.reset_sem_counters()
@@ -965,6 +990,23 @@ class DeepseekGenerator:
                 # Positions for the first generated token are the prompt lengths
                 positions = lengths.clone()
 
+                spec_tokens = None
+                if use_mtp_path and prefill_last_hidden is not None:
+                    hidden_size = int(self.hf_config.hidden_size)
+                    hidden_tail = torch.zeros((num_of_users, hidden_size), dtype=torch.bfloat16)
+                    for i, last_hidden in enumerate(prefill_last_hidden):
+                        if last_hidden is not None:
+                            hidden_tail[i] = last_hidden
+                    positions_tail = lengths.clone()
+                    positions_tail = torch.clamp(positions_tail - 1, min=0)
+                    spec_logits = self._mtp_predict_logits(
+                        hidden_states=hidden_tail,
+                        tokens_step=next_tokens,
+                        positions=positions_tail,
+                    )
+                    self.ccl.reset_sem_counters()
+                    spec_tokens = self._sample_greedy(spec_logits)[:num_of_prompts]
+
                 # Record token 0
                 for i in range(num_of_prompts):
                     token_value = int(next_tokens[i].item())
@@ -979,66 +1021,29 @@ class DeepseekGenerator:
                 profiler.start("inference_decode")
                 decode_step_idx = 0
                 mtp_accept_rate = None
-                use_mtp_path = (
-                    self.enable_mtp and teacher_forcing is None and (not self.enable_trace) and max_new_tokens > 1
-                )
-                if use_mtp_path and 2 * num_of_prompts > num_of_users:
-                    logger.warning(
-                        f"MTP verify batching needs 2x prompt lanes ({2 * num_of_prompts}) but only {num_of_users} are available; "
-                        "falling back to regular decode path."
-                    )
-                    use_mtp_path = False
+                debug_mtp = bool(int(os.getenv("DEEPSEEK_MTP_DEBUG", "0")))
+                debug_mtp_steps = int(os.getenv("DEEPSEEK_MTP_DEBUG_STEPS", "3"))
+                debug_mtp_step_idx = 0
                 if use_mtp_path:
                     prompt_mask = torch.arange(num_of_users) < num_of_prompts
                     generated_counts = torch.zeros((num_of_users,), dtype=torch.int32)
                     generated_counts[prompt_mask] = 1
                     verify_offset = num_of_prompts
 
-                    # Bootstrap with one regular decode to obtain hidden states for the first MTP candidate.
-                    logger.info(f"Decoding step {decode_step_idx} for {num_of_prompts} user(s)...")
-                    profiler.start(f"decode_time_{decode_step_idx}")
-                    logits_tt, hidden_tt = self._decode_step_tt(
-                        tokens_step=next_tokens,
-                        positions=positions,
-                        batch_size_per_row=self.batch_size_per_row,
-                        return_hidden=True,
-                    )
-                    logits = ttnn.to_torch(
-                        logits_tt,
-                        mesh_composer=ttnn.ConcatMesh2dToTensor(
-                            self.mesh_device, dims=(-2, -1), mesh_shape=self.mesh_device.shape
-                        ),
-                    )
-                    ttnn.deallocate(logits_tt)
-                    profiler.end(f"decode_time_{decode_step_idx}")
-                    decode_step_idx += 1
-                    self.ccl.reset_sem_counters()
-
-                    pred_tokens = self._sample_greedy(logits.squeeze(0).squeeze(0))
-                    next_tokens = pred_tokens
-                    positions = positions + 1
-                    for i in range(num_of_prompts):
-                        if generated_counts[i] >= max_new_tokens:
-                            continue
-                        token_value = int(next_tokens[i].item())
-                        generations[i].append(token_value)
-                        generated_counts[i] += 1
-                        if early_print_first_user and i == 0:
-                            if self.tokenizer is not None:
-                                print(self.tokenizer.decode(token_value, skip_special_tokens=True), end="", flush=True)
-                            else:
-                                print(f"{token_value} ", end="", flush=True)
-
-                    spec_logits = self._mtp_predict_logits(
-                        hidden_states=hidden_tt,
-                        tokens_step=next_tokens,
-                        positions=positions,
-                    )
-                    self.ccl.reset_sem_counters()
-                    ttnn.deallocate(hidden_tt)
-                    spec_tokens = self._sample_greedy(spec_logits)[:num_of_prompts]
+                    if spec_tokens is None:
+                        raise RuntimeError("MTP spec tokens were not initialized; prefill hidden states missing.")
+                    if debug_mtp:
+                        logger.info(
+                            "MTP bootstrap: curr[0]={} spec[0]={} pos[0]={}".format(
+                                int(next_tokens[0].item()),
+                                int(spec_tokens[0].item()),
+                                int(positions[0].item()),
+                            )
+                        )
                     total_accepts = 0
                     total_verifies = 0
+                    total_accepts_alt = 0
+                    total_verifies_alt = 0
 
                     while any(generated_counts[i] < max_new_tokens for i in range(num_of_prompts)):
                         # Pack verification batch into available decode lanes:
@@ -1117,6 +1122,27 @@ class DeepseekGenerator:
                                 next_tokens[i] = next_value
                                 positions[i] = positions[i] + 1
 
+                        if debug_mtp and debug_mtp_step_idx < debug_mtp_steps:
+                            debug_mtp_step_idx += 1
+                            logger.info(
+                                "MTP debug step {}: curr[0]={} pos[0]={} pred_next[0]={} spec[0]={} pred_after_spec[0]={}".format(
+                                    debug_mtp_step_idx,
+                                    int(next_tokens[0].item()),
+                                    int(positions_before[0].item()),
+                                    int(pred_next[0].item()),
+                                    int(spec_tokens[0].item()),
+                                    int(pred_after_spec[0].item()),
+                                )
+                            )
+
+                        if debug_mtp:
+                            for i in range(num_of_prompts):
+                                if generated_counts[i] >= max_new_tokens:
+                                    continue
+                                total_verifies_alt += 1
+                                if int(pred_after_spec[i].item()) == int(spec_tokens[i].item()):
+                                    total_accepts_alt += 1
+
                         # Keep non-prompt lanes advancing to preserve tensor shapes.
                         for i in range(num_of_prompts, num_of_users):
                             next_tokens[i] = pred_all[i]
@@ -1125,10 +1151,10 @@ class DeepseekGenerator:
                         tokens_for_spec = next_tokens.clone()
                         positions_for_spec = positions.clone()
                         tokens_for_spec[:num_of_prompts] = pred_next
-                        positions_for_spec[:num_of_prompts] = positions_before[:num_of_prompts] + 1
+                        positions_for_spec[:num_of_prompts] = positions_before[:num_of_prompts]
                         tokens_for_spec[verify_offset : verify_offset + num_of_prompts] = pred_after_spec
                         positions_for_spec[verify_offset : verify_offset + num_of_prompts] = (
-                            positions_before[:num_of_prompts] + 2
+                            positions_before[:num_of_prompts] + 1
                         )
                         spec_logits_full = self._mtp_predict_logits(
                             hidden_states=hidden_2b_tt,
@@ -1151,6 +1177,11 @@ class DeepseekGenerator:
                             raise RuntimeError(
                                 f"MTP accept rate {mtp_accept_rate:.3f} below required minimum "
                                 f"{self.min_mtp_accept_rate:.3f}"
+                            )
+                        if debug_mtp and total_verifies_alt > 0:
+                            alt_rate = total_accepts_alt / total_verifies_alt
+                            logger.info(
+                                f"MTP alt accept rate (spec vs pred_after_spec): {total_accepts_alt}/{total_verifies_alt} = {alt_rate:.3f}"
                             )
                     elif self.min_mtp_accept_rate is not None:
                         raise RuntimeError("MTP verification produced zero samples; cannot validate accept rate.")
@@ -1281,6 +1312,8 @@ class DeepseekGenerator:
         user_id: int,
         page_table: torch.Tensor | None = None,
         local_user_id: int | None = None,
+        prompt_len: int | None = None,
+        return_last_hidden: bool = False,
     ) -> torch.Tensor:
         """Run prefill for the full prompt sequence and return logits for the last position.
 
@@ -1326,13 +1359,24 @@ class DeepseekGenerator:
             page_tables_to_use = self._get_page_tables()
 
         # RowBatchedModel forward prefill
-        logits_tt = RowBatchedModel.forward_prefill(
-            x=tt_tokens,
-            user_id=user_id,
-            cfg=self.model_run_config_prefill,
-            rope_tensors=rope_tensors,
-            page_tables=page_tables_to_use,
-        )
+        last_hidden = None
+        if self.enable_mtp:
+            logits_tt, hidden_tt = RowBatchedModel.forward_prefill(
+                x=tt_tokens,
+                user_id=user_id,
+                cfg=self.model_run_config_prefill,
+                rope_tensors=rope_tensors,
+                page_tables=page_tables_to_use,
+                return_hidden=True,
+            )
+        else:
+            logits_tt = RowBatchedModel.forward_prefill(
+                x=tt_tokens,
+                user_id=user_id,
+                cfg=self.model_run_config_prefill,
+                rope_tensors=rope_tensors,
+                page_tables=page_tables_to_use,
+            )
 
         # Gather to host
         logits = ttnn.to_torch(
@@ -1340,9 +1384,80 @@ class DeepseekGenerator:
             mesh_composer=ttnn.ConcatMesh2dToTensor(self.mesh_device, dims=(-2, -1), mesh_shape=self.mesh_device.shape),
         )
 
+        if self.enable_mtp:
+            # Prime MTP cache for this user using prompt tokens.
+            mtp_page_table = self._get_mtp_page_table()
+            full_seq_len = int(hidden_tt.shape[2])
+            if full_seq_len > 0:
+                # MTP prefill requires the shifted token length to be divisible by the reduce_scatter ring size.
+                # Use the full padded prompt length (aligned in _pad_batch) and append one pad token so
+                # token[t+1] aligns with hidden[t] across the entire padded span.
+                hidden_shifted = ttnn.slice(hidden_tt, [0, 0, 0, 0], [1, 1, full_seq_len, hidden_tt.shape[3]])
+
+                pad_id = self._get_pad_id()
+                tokens_host = tokens[:, :, :full_seq_len]
+                pad_token = torch.full((1, 1, 1), pad_id, dtype=tokens_host.dtype)
+                tokens_host_ext = torch.cat([tokens_host, pad_token], dim=-1)
+                tokens_shifted_host = tokens_host_ext[:, :, 1:]
+                tokens_shifted = ttnn.from_torch(
+                    tokens_shifted_host,
+                    device=self.mesh_device,
+                    mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh_device),
+                    dtype=ttnn.uint32,
+                    memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                    layout=ttnn.ROW_MAJOR_LAYOUT,
+                )
+
+                # Slice RoPE to match the shifted sequence length (positions 0..full_seq_len-1).
+                cos_matrix = rope_tensors["cos_matrix"]
+                sin_matrix = rope_tensors["sin_matrix"]
+                cos_trim = ttnn.slice(cos_matrix, [0, 0, 0, 0], [1, 1, full_seq_len, cos_matrix.shape[3]])
+                sin_trim = ttnn.slice(sin_matrix, [0, 0, 0, 0], [1, 1, full_seq_len, sin_matrix.shape[3]])
+                mtp_rope_tensors = {
+                    "cos_matrix": cos_trim,
+                    "sin_matrix": sin_trim,
+                    "trans_matrix": rope_tensors["trans_matrix"],
+                }
+
+                mtp_logits_tt = RowBatchedModel.forward_mtp_prefill(
+                    hidden_states=hidden_shifted,
+                    token_ids=tokens_shifted,
+                    user_id=user_id,
+                    cfg=self.model_run_config_prefill,
+                    rope_tensors=mtp_rope_tensors,
+                    page_table=mtp_page_table,
+                )
+                ttnn.deallocate(hidden_shifted)
+                ttnn.deallocate(tokens_shifted)
+                ttnn.deallocate(cos_trim)
+                ttnn.deallocate(sin_trim)
+                ttnn.deallocate(mtp_logits_tt)
+                self.ccl.reset_sem_counters()
+
+            if return_last_hidden:
+                if prompt_len is None:
+                    raise ValueError("prompt_len is required when return_last_hidden=True")
+                if prompt_len <= 0:
+                    last_hidden = torch.zeros((self.hf_config.hidden_size,), dtype=torch.bfloat16)
+                else:
+                    hidden_idx = min(prompt_len - 1, full_seq_len - 1)
+                    hidden_slice = ttnn.slice(hidden_tt, [0, 0, hidden_idx, 0], [1, 1, 1, hidden_tt.shape[3]])
+                    last_hidden = ttnn.to_torch(
+                        hidden_slice,
+                        mesh_composer=ttnn.ConcatMesh2dToTensor(
+                            self.mesh_device, dims=(-2, -1), mesh_shape=self.mesh_device.shape
+                        ),
+                    )
+                    last_hidden = last_hidden.squeeze(0).squeeze(0).squeeze(0)
+                    ttnn.deallocate(hidden_slice)
+
+            ttnn.deallocate(hidden_tt)
+
         # Free device tensors for this step
         ttnn.deallocate(tt_tokens)
         ttnn.deallocate(logits_tt)
+        if return_last_hidden:
+            return logits, last_hidden
         return logits  # [1, 1, seq_len, V]
 
     def _capture_decode_trace(

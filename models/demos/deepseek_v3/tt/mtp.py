@@ -28,6 +28,7 @@ from models.demos.deepseek_v3.utils.run_config import (
     ModelPrefillConfig,
     ModelState,
     RunDecodeConfig,
+    RunPrefillConfig,
     WeightConfig,
 )
 from models.tt_transformers.tt.common import PagedAttentionConfig
@@ -264,7 +265,8 @@ class MTP2D(AbstractModule):
         )
         ttnn.deallocate(token_norm)
 
-        concat_in = ttnn.concat([hidden_full, token_full], **cfg["concat"])
+        # Concatenate token embedding then hidden.
+        concat_in = ttnn.concat([token_full, hidden_full], **cfg["concat"])
         ttnn.deallocate(hidden_full)
         ttnn.deallocate(token_full)
 
@@ -294,3 +296,69 @@ class MTP2D(AbstractModule):
         )
         ttnn.deallocate(head_norm_out)
         return LMHead1D.forward_decode(head_full, cfg["head"])
+
+    @classmethod
+    def forward_prefill(
+        cls,
+        hidden_states: ttnn.Tensor,
+        token_ids: ttnn.Tensor,
+        user_id: int,
+        cfg: RunPrefillConfig,
+        rope_tensors: dict,
+        page_table: ttnn.Tensor,
+    ) -> ttnn.Tensor:
+        ccl = cfg["ccl"]
+
+        token_emb = Embedding2D.forward_prefill(token_ids, cfg["embedding"])
+
+        hidden_norm_in = ttnn.to_memory_config(hidden_states, **cfg["hidden_norm_reshard"])
+        hidden_norm = DistributedRMSNorm.forward_prefill(hidden_norm_in, cfg["hidden_norm"])
+        if _has_distinct_buffer(hidden_norm_in, hidden_states):
+            ttnn.deallocate(hidden_norm_in)
+
+        token_norm_in = ttnn.to_memory_config(token_emb, **cfg["token_norm_reshard"])
+        token_norm = DistributedRMSNorm.forward_prefill(token_norm_in, cfg["token_norm"])
+        if _has_distinct_buffer(token_norm_in, token_emb):
+            ttnn.deallocate(token_norm_in)
+        ttnn.deallocate(token_emb)
+
+        hidden_full = ttnn.experimental.all_gather_async(
+            hidden_norm, **ccl.populate_all_gather_runtime_args(cfg["norm_all_gather"])
+        )
+        ttnn.deallocate(hidden_norm)
+        token_full = ttnn.experimental.all_gather_async(
+            token_norm, **ccl.populate_all_gather_runtime_args(cfg["norm_all_gather"])
+        )
+        ttnn.deallocate(token_norm)
+
+        # Concatenate token embedding then hidden.
+        concat_in = ttnn.concat([token_full, hidden_full], **cfg["concat"])
+        ttnn.deallocate(hidden_full)
+        ttnn.deallocate(token_full)
+
+        eh_out = ttnn.linear(concat_in, **cfg["eh_proj"]["linear"])
+        ttnn.deallocate(concat_in)
+
+        decoder_in = ttnn.to_memory_config(eh_out, **cfg["decoder_input_reshard"])
+        if _has_distinct_buffer(decoder_in, eh_out):
+            ttnn.deallocate(eh_out)
+        decoder_out = MoEDecoderBlock2D.forward_prefill(
+            decoder_in,
+            user_id,
+            cfg["decoder_block"],
+            rope_tensors,
+            page_table,
+        )
+        ttnn.deallocate(decoder_in)
+
+        head_norm_in = ttnn.to_memory_config(decoder_out, **cfg["head_norm_reshard"])
+        if _has_distinct_buffer(head_norm_in, decoder_out):
+            ttnn.deallocate(decoder_out)
+        head_norm_out = DistributedRMSNorm.forward_prefill(head_norm_in, cfg["head_norm"])
+        ttnn.deallocate(head_norm_in)
+
+        head_full = ttnn.experimental.all_gather_async(
+            head_norm_out, **ccl.populate_all_gather_runtime_args(cfg["head_all_gather"])
+        )
+        ttnn.deallocate(head_norm_out)
+        return LMHead1D.forward_prefill(head_full, cfg["head"])

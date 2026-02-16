@@ -397,14 +397,61 @@ def run_demo(
                 prompt_list = prompts
 
         # Multi-prompt generation
-        generations, statistics = gen.generate(
-            prompt_list,
-            max_new_tokens=max_new_tokens,
-            teacher_forcing=token_acc,
-            early_print_first_user=early_print_first_user,
-            repeat_batches=repeat_batches,
-            pre_tokenized=pre_tokenized_prompts,
-        )
+        use_mtp_path = gen.enable_mtp and token_acc is None and (not gen.enable_trace) and max_new_tokens > 1
+        max_prompts_per_batch = gen.batch_size
+        if use_mtp_path:
+            max_prompts_per_batch = max(1, gen.batch_size // 2)
+
+        if use_mtp_path and len(prompt_list) > max_prompts_per_batch:
+            logger.info(
+                f"MTP enabled with {len(prompt_list)} prompts; running in batches of up to {max_prompts_per_batch} "
+                "to reserve lanes for verify batching."
+            )
+            all_generations = []
+            all_stats = []
+            for start in range(0, len(prompt_list), max_prompts_per_batch):
+                batch_prompts = prompt_list[start : start + max_prompts_per_batch]
+                batch_pre_tokenized = (
+                    pre_tokenized_prompts[start : start + max_prompts_per_batch]
+                    if pre_tokenized_prompts is not None
+                    else None
+                )
+                batch_generations, batch_stats = gen.generate(
+                    batch_prompts,
+                    max_new_tokens=max_new_tokens,
+                    teacher_forcing=token_acc,
+                    early_print_first_user=early_print_first_user,
+                    repeat_batches=repeat_batches,
+                    pre_tokenized=batch_pre_tokenized,
+                )
+                all_generations.extend(batch_generations)
+                all_stats.append(batch_stats)
+
+            generations = all_generations
+            statistics = all_stats[-1] if all_stats else {}
+            if all_stats:
+                statistics["batch_count"] = len(all_stats)
+                mtp_rates = [s.get("mtp_accept_rate") for s in all_stats if s.get("mtp_accept_rate") is not None]
+                if mtp_rates:
+                    statistics["mtp_accept_rate"] = sum(mtp_rates) / len(mtp_rates)
+                for key in (
+                    "preparing_prefill_config",
+                    "preparing_decode_config",
+                    "inference_prefill",
+                    "inference_decode",
+                    "Full demo runtime",
+                ):
+                    if any(key in s for s in all_stats):
+                        statistics[key] = sum(float(s.get(key, 0) or 0) for s in all_stats)
+        else:
+            generations, statistics = gen.generate(
+                prompt_list,
+                max_new_tokens=max_new_tokens,
+                teacher_forcing=token_acc,
+                early_print_first_user=early_print_first_user,
+                repeat_batches=repeat_batches,
+                pre_tokenized=pre_tokenized_prompts,
+            )
 
         # Process all generations
         results = []
