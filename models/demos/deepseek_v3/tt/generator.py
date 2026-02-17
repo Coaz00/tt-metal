@@ -842,9 +842,10 @@ class DeepseekGenerator:
         max_len = max(len(t) for t in tokens_list)
         if self.prefill_max_tokens is not None:
             max_len = min(self.prefill_max_tokens, max_len)  # truncate all sequences to the prefill_max_tokens
-        # Round up to nearest multiple of TILE_SIZE * mesh_axis to satisfy reduce_scatter constraints.
+        # Round up to nearest multiple of TILE_SIZE. Only expand to ring-size alignment for MTP runs
+        # to avoid long padding affecting baseline logits.
         ring_size = int(self.mesh_device.shape[0])
-        alignment = ttnn.TILE_SIZE * max(ring_size, 1)
+        alignment = ttnn.TILE_SIZE * max(ring_size, 1) if self.enable_mtp else ttnn.TILE_SIZE
         max_len = ((max_len + alignment - 1) // alignment) * alignment
 
         pad_id = self._get_pad_id()

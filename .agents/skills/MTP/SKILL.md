@@ -46,6 +46,7 @@ description: Bring up multi-token prediction (speculative decoding) for TTNN tra
 - Track accept rate (target ~0.8; investigate if <0.5).
 - Do not enable MTP for teacher-forcing accuracy; compare baseline vs MTP outputs instead.
 - MTP cannot be forced when using `--override-num-layers` (no MTP layer in truncated configs). Use full model for MTP verification.
+- Always verify baseline outputs match the known-good reference commit (e.g., `f250fa...`) before judging MTP.
 
 ## Watch For Common Failures
 - `TT_FATAL reduce_scatter ring_size` in MTP prefill:
