@@ -1131,6 +1131,7 @@ class DeepseekGenerator:
                 debug_mtp_steps = int(os.getenv("DEEPSEEK_MTP_DEBUG_STEPS", "3"))
                 debug_mtp_step_idx = 0
                 if use_mtp_path:
+                    skip_accept_decode = bool(int(os.getenv("DEEPSEEK_MTP_SKIP_ACCEPT_DECODE", "1")))
                     prompt_mask = torch.arange(num_of_users) < num_of_prompts
                     generated_counts = torch.zeros((num_of_users,), dtype=torch.int32)
                     generated_counts[prompt_mask] = 1
@@ -1158,6 +1159,7 @@ class DeepseekGenerator:
                     total_verifies = 0
                     total_accepts_alt = 0
                     total_verifies_alt = 0
+                    skipped_decode_tokens = 0
 
                     while any(generated_counts[i] < max_new_tokens for i in range(num_of_prompts)):
                         # Pack verification batch into available decode lanes:
@@ -1231,7 +1233,9 @@ class DeepseekGenerator:
                             if accepted_prompt_mask[i] and generated_counts[i] < max_new_tokens
                         ]
                         spec_from_accepted = None
-                        if accepted_indices:
+                        if skip_accept_decode and accepted_indices:
+                            skipped_decode_tokens += len(accepted_indices)
+                        elif accepted_indices:
                             accepted_tokens = next_tokens.clone()
                             accepted_positions = positions.clone()
                             for i in accepted_indices:
@@ -1383,12 +1387,14 @@ class DeepseekGenerator:
 
                         spec_tokens_next = spec_all[:num_of_prompts]
                         spec_tokens = spec_tokens_next
-                        if spec_from_accepted is not None:
+                        if spec_from_accepted is not None and not skip_accept_decode:
                             spec_tokens[accepted_prompt_mask] = spec_from_accepted[accepted_prompt_mask]
 
                     if total_verifies > 0:
                         mtp_accept_rate = total_accepts / total_verifies
                         logger.info(f"MTP accept rate: {total_accepts}/{total_verifies} = {mtp_accept_rate:.3f}")
+                        if skip_accept_decode:
+                            logger.info(f"MTP skipped decode tokens via accepted speculation: {skipped_decode_tokens}")
                         if self.min_mtp_accept_rate is not None and mtp_accept_rate < self.min_mtp_accept_rate:
                             raise RuntimeError(
                                 f"MTP accept rate {mtp_accept_rate:.3f} below required minimum "

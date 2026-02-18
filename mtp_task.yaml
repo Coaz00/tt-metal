@@ -1,8 +1,9 @@
 prompt: |
-  The goal is to **implement multi token prediction for deepseek R1**. Please read the deepseek code in models/demos/deepseek_v3. The goal is to add support for the second token prediction and make it work end to end including batching the next token and the next-next token in the following fwd pass and the acceptance/rejection logic. Make sure to test the model after integration of the multi token extension and verify that the accuracy is good and that there are no hangs. There are three verifications steps to make sure the MTP is working:
+  The goal is to **implement multi token prediction for deepseek R1**. Please read the deepseek code in models/demos/deepseek_v3. The goal is to add support for the second token prediction and make it work end to end including batching the predicted token and the speculated token (next-next token) in the following fwd pass, the acceptance/rejection logic, and skipping the unnecessary decode step in case of acceptance of the previous speculated token. Make sure to test the model after integration of the multi token extension and verify that the accuracy is good and that there are no hangs. There are three verifications steps to make sure the MTP is working:
   1. Verify that the current branch, with MTP disabled, produces the exact same outputs as the reference commit off main f250fa343767e85500afd3db46f3a7f3d31b11ff. The full demo outputs for that run are stored in the log file logs/deepseek_demo_baseline_f250fa_20260216_195652.json.
   2. Verify that the current branch with MTP enabled produces the exact same outputs as MTP disabled using the full demo
-  3. Verify that the acceptance rate it > 50% (expected 80% on average) to make sure that the MTP is actually working and used to produce the outputs.
+  3. Verify that the acceptance rate it >= 75% to make sure that the MTP is actually working and used to produce the outputs.
+  4. Verify that the acceptance of the previous speculated token is used to skip the unnecessary decode step, and the previous speculated token is used to produce the next prediction and speculation.
 
   Read instructions in .agents/skills.
 
