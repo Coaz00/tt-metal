@@ -1,0 +1,42 @@
+prompt: |
+  The goal is to **implement multi token prediction for deepseek R1**. Please read the deepseek code in models/demos/deepseek_v3. The goal is to add support for the second token prediction and make it work end to end including batching the next token and the next-next token in the following fwd pass and the acceptance/rejection logic. Make sure to test the model after integration of the multi token extension and verify that the accuracy is good and that there are no hangs. There are three verifications steps to make sure the MTP is working:
+  1. Verify that the current branch, with MTP disabled, produces the exact same outputs as the reference commit off main f250fa343767e85500afd3db46f3a7f3d31b11ff. The full demo outputs for that run are stored in the log file logs/deepseek_demo_baseline_f250fa_20260216_195652.json.
+  2. Verify that the current branch with MTP enabled produces the exact same outputs as MTP disabled using the full demo
+  3. Verify that the acceptance rate it > 50% (expected 80% on average) to make sure that the MTP is actually working and used to produce the outputs.
+
+  Read instructions in .agents/skills.
+
+  Use the following command for testing:
+  To run the full demo for a verification of outputs to match with/without MTP (runtime ~20 mins, use 30 mins timeout), use 8 users for a reduced faster test:
+  ```bash
+  /home/shared/scripts/ds-run python /home/jrock/wa/tt-metal/models/demos/deepseek_v3/demo/demo.py --prompts-file /home/jrock/
+  wa/tt-metal/models/demos/deepseek_v3/demo/test_prompts.json --num-prompts 8 --output-path /home/jrock/wa/tt-metal/logs/
+  deepseek_demo_$(date +%Y%m%d_%H%M%S).json --max-new-tokens 32 --cache-dir /mnt/MLPerf/tt_dnn-models/
+  deepseek-ai/DeepSeek-R1-0528-Cache/CI --model-path /mnt/MLPerf/tt_dnn-models/deepseek-ai/DeepSeek-R1-0528 2>&1 | tee /home/jrock/
+  wa/tt-metal/logs/deepseek_deo_log_$(date +%Y%m%d_%H%M%S).log
+  ```
+  Note: The demo will run for 20-30 minutes, so make sure to check back in 5 min. intervals and wait until the demo is done. Do not end the session prematurely.
+
+  If there are machine issues, reset the machine using:
+  `/home/shared/scripts/reset.sh`
+
+set_up: |
+  Run the following commands to set up the environment:
+  source ../setup_metal.sh
+  export DEEPSEEK_V3_MAX_SEQ_LEN=128
+
+  Familiarize yourself with the deepseek code in /home/jrock/wa/tt-metal/models/demos/deepseek_v3 and read the skills collection in .agents/skills.
+
+check: |
+  Check the agent's output and assess whether the agent needs to follow up on the task or whether it thinks the task is complete. If it thinks the task is complete, check the verification steps and give a summary of the results. Check also that the reference file in filepath logs/deepseek_demo_baseline_f250fa_20260216_195652.json has not been changed. If it needs to follow up, give the follow up instructions. If you think the agent is stuck, try to unblock it by brainstorming with it, if you still can't unblock it, prompt the user to help.
+
+on_success: |
+  Give a summary of the results and the verification steps. Update the .agents/skills/MTP/SKILL.md file with learnings for future reference.
+
+on_failure: |
+  Update the .agents/skills/MTP/SKILL.md file with learnings for future reference.
+
+tear_down: |
+  Nothing to tear down.
+
+max_iterations: 2  # Optional (default is 10). 0 means unlimited.

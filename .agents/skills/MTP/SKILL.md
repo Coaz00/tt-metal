@@ -22,16 +22,17 @@ description: Bring up multi-token prediction (speculative decoding) for TTNN tra
 ## Prime MTP Prefill Cache
 - Initialize MTP KV cache after base prefill.
 - Align inputs to the MTP rule (hidden at t with token at t+1):
-  - `hidden_shifted = hidden[:, :-1]`
-  - `token_shifted = tokens[:, 1:]`
-  - Trim RoPE `cos/sin` to `seq_len-1` (do not shift; just slice)
-- Avoid padding the tail token/hidden. Padding biases acceptance and can hide alignment bugs.
+  - Keep hidden aligned to cache positions (`hidden_shifted = hidden`).
+  - Left-shift token ids to build `token_shifted = [tokens[:, :, 1:], pad_id]`.
+  - Keep RoPE unshifted and aligned to the same prefill sequence length.
+- Do not prepend pad tokens or add extra timesteps in prefill priming.
 - Build shifted tokens on host if TTNN concat/shard causes CCL reduce_scatter failures.
 - For multi-device reduce_scatter, the MTP prefill sequence length must be divisible by the ring size. Use the padded `full_seq_len` from `_pad_batch` for MTP prefill, then trim after all_gather.
 
 ## Align Decode Positions
 - Align MTP decode positions to the token being predicted.
-- Use `positions_before` for the MTP candidate token, and `positions_before+1` for verifying the next-next token.
+- For the first MTP candidate pass (using `hidden[t]` + `token[t+1]`), use `positions_before+1`.
+- For verification of the next-next token, use `positions_before+2`.
 
 ## Implement Accept/Reject Logic
 - Accept when MTP next-next token equals base verified token.
@@ -74,3 +75,36 @@ description: Bring up multi-token prediction (speculative decoding) for TTNN tra
 - `models/demos/deepseek_v3/tt/generator.py`
 - `models/demos/deepseek_v3/tt/mtp.py`
 - `models/demos/deepseek_v3/tt/model/row_batched_model.py`
+
+## Recent Learnings (2026-02)
+- Acceptance can be near-zero even when outputs still look plausible. The highest-leverage first checks are:
+  - `positions_tail` for first spec pass should use current decode lengths directly (no `-1` clamp).
+  - `positions_for_spec` should be `positions_before+1` for candidate and `positions_before+2` for verification.
+- Keep MTP prefill alignment strict and simple:
+  - Use full padded prefill length for cache priming.
+  - Keep `hidden_shifted` aligned to cache positions and shift tokens to represent `token[t+1]` (pad tail only).
+  - RoPE trimming must match the shifted sequence length exactly.
+- Mesh/shard shape mismatches show up late and look unrelated:
+  - Before MTP concat/projection, force hidden/token sequence dims to match (slice both to `min_len` if needed).
+  - When creating helper/dummy tensors, derive from already-sharded tensors to preserve memory layout and avoid ND chunk errors.
+- For debug speed, prefer targeted acceptance diagnostics over full traces:
+  - Log accepted/rejected lanes with `(position, pred_next, spec_token, pred_after_spec)` tuples.
+  - This makes off-by-one and token/hidden misalignment visible within a few steps.
+
+## Additional Learnings For Future Runs (2026-02)
+- Use a strict triage order when acceptance regresses:
+  - First verify decode position math, then hidden/token alignment, then concat ordering, then mesh/shard shape parity.
+  - This avoids spending time on low-probability causes before the common off-by-one failures are ruled out.
+- Keep baseline and MTP runs as deterministic as possible during bring-up:
+  - Use greedy decode, fixed prompts, and the same max-seq clamp.
+  - Compare outputs and acceptance from identical run settings before changing kernels or sharding.
+- Treat acceptance and output parity as separate gates:
+  - Gate 1: exact output parity vs non-MTP baseline.
+  - Gate 2: acceptance threshold (investigate if low, but do not accept output divergence even if acceptance improves).
+- Add lightweight stepwise checks before full long-context runs:
+  - Validate first accepted token transition and first reject transition in short runs (`max_seq_len=128`).
+  - Only then scale to longer contexts to avoid expensive iteration loops.
+- When touching prefill/cache code, re-check all three invariants together:
+  - MTP prefill uses padded `full_seq_len`.
+  - Hidden stays unshifted while tokens are left-shifted with tail pad.
+  - RoPE slicing/trim length matches the effective MTP prefill sequence exactly.

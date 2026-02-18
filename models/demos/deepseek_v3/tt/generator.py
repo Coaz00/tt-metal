@@ -183,6 +183,8 @@ class DeepseekGenerator:
         self.model_weight_config = None
         self.page_tables_tt = None
         self.mtp_page_table_tt = None
+        self.base_page_table_host = None
+        self.mtp_page_table_host = None
 
         # Trace state (decode)
         self._trace_id: int | None = None
@@ -547,6 +549,8 @@ class DeepseekGenerator:
                 del self.page_tables_tt
         except Exception as e:
             logger.warning(f"Failed to cleanup page tables: {e}")
+        self.base_page_table_host = None
+        self.mtp_page_table_host = None
         try:
             if self.mtp_page_table_tt is not None:
                 ttnn.deallocate(self.mtp_page_table_tt)
@@ -643,10 +647,16 @@ class DeepseekGenerator:
         assert hasattr(self, "mesh_device") and self.mesh_device is not None
         assert hasattr(self, "batch_size_per_row") and self.batch_size_per_row is not None
         assert hasattr(self, "hf_config") and self.hf_config is not None
+        batch_per_shard = even_int_div(self.batch_size_per_row, self.dp_factor)
+        blocks_per_user = even_int_div(self.paged_config.max_num_blocks, batch_per_shard)
+        self.base_page_table_host = torch.randperm(self.paged_config.max_num_blocks, dtype=torch.int32).reshape(
+            batch_per_shard, blocks_per_user
+        )
         self.page_tables_tt = tuple(
             MLA2D.create_page_table(
                 paged_config=self.paged_config,
                 mesh_device=self.mesh_device,
+                page_table=self.base_page_table_host,
                 batch_size_per_row=int(self.batch_size_per_row / self.mesh_device.shape[0]),
             )
             for _ in range(self.hf_config.num_hidden_layers)
@@ -661,9 +671,15 @@ class DeepseekGenerator:
         assert hasattr(self, "mesh_device") and self.mesh_device is not None
         assert hasattr(self, "batch_size_per_row") and self.batch_size_per_row is not None
 
+        batch_per_shard = even_int_div(self.batch_size_per_row, self.dp_factor)
+        blocks_per_user = even_int_div(self.paged_config.max_num_blocks, batch_per_shard)
+        self.mtp_page_table_host = torch.randperm(self.paged_config.max_num_blocks, dtype=torch.int32).reshape(
+            batch_per_shard, blocks_per_user
+        )
         self.mtp_page_table_tt = MLA2D.create_page_table(
             paged_config=self.paged_config,
             mesh_device=self.mesh_device,
+            page_table=self.mtp_page_table_host,
             batch_size_per_row=int(self.batch_size_per_row / self.mesh_device.shape[0]),
         )
         return self.mtp_page_table_tt
@@ -716,7 +732,7 @@ class DeepseekGenerator:
         tokens_step: torch.Tensor,
         positions: torch.Tensor,
         batch_size_per_row: int,
-        page_tables: torch.Tensor | None = None,
+        page_tables: torch.Tensor | tuple[ttnn.Tensor, ...] | None = None,
         return_hidden: bool = False,
     ) -> ttnn.Tensor | tuple[ttnn.Tensor, ttnn.Tensor]:
         """Run a single decode step and return TT tensors."""
@@ -736,7 +752,9 @@ class DeepseekGenerator:
             dtype=ttnn.int32,
         )
 
-        if page_tables is not None:
+        if isinstance(page_tables, tuple):
+            page_tables_to_use = page_tables
+        elif page_tables is not None:
             page_tables_to_use = self._convert_vllm_page_table_for_batch(page_tables, device=self.mesh_device)
         else:
             page_tables_to_use = self._get_page_tables()
@@ -753,11 +771,73 @@ class DeepseekGenerator:
         ttnn.deallocate(tt_positions)
         return decode_out
 
+    def _build_mtp_verify_page_tables(self, num_prompts: int, verify_offset: int) -> tuple[ttnn.Tensor, ...]:
+        """Build per-layer page tables where verify lanes alias prompt lanes."""
+        if num_prompts <= 0:
+            return self._get_page_tables()
+
+        _ = self._get_page_tables()
+        if self.base_page_table_host is None:
+            raise RuntimeError("Base page table host tensor is not initialized.")
+        base_page_table = self.base_page_table_host.to(torch.int32)
+        if base_page_table.dim() != 2:
+            raise RuntimeError(f"Unexpected page table rank for MTP verify aliasing: {tuple(base_page_table.shape)}")
+
+        alias_page_table = base_page_table.clone()
+        num_rows = int(alias_page_table.shape[0])
+        if num_rows <= 0:
+            raise RuntimeError("Page table has zero rows; cannot build MTP verify aliasing.")
+
+        for i in range(num_prompts):
+            src_row = i % num_rows
+            dst_row = (verify_offset + i) % num_rows
+            alias_page_table[dst_row] = alias_page_table[src_row]
+
+        aliased_tt = MLA2D.create_page_table(
+            paged_config=self.paged_config,
+            mesh_device=self.mesh_device,
+            page_table=alias_page_table,
+            batch_size_per_row=int(self.batch_size_per_row / self.mesh_device.shape[0]),
+        )
+        out = tuple(ttnn.clone(aliased_tt) for _ in range(self.hf_config.num_hidden_layers))
+        ttnn.deallocate(aliased_tt)
+        return out
+
+    def _build_mtp_verify_mtp_page_table(self, num_prompts: int, verify_offset: int) -> ttnn.Tensor:
+        """Build an aliased MTP page table where verify lanes alias prompt lanes."""
+        if num_prompts <= 0:
+            return ttnn.clone(self._get_mtp_page_table())
+
+        _ = self._get_mtp_page_table()
+        if self.mtp_page_table_host is None:
+            raise RuntimeError("MTP base page table host tensor is not initialized.")
+        base_page_table = self.mtp_page_table_host.to(torch.int32)
+        if base_page_table.dim() != 2:
+            raise RuntimeError(f"Unexpected MTP page table rank: {tuple(base_page_table.shape)}")
+
+        alias_page_table = base_page_table.clone()
+        num_rows = int(alias_page_table.shape[0])
+        if num_rows <= 0:
+            raise RuntimeError("MTP page table has zero rows; cannot build verify aliasing.")
+
+        for i in range(num_prompts):
+            src_row = i % num_rows
+            dst_row = (verify_offset + i) % num_rows
+            alias_page_table[dst_row] = alias_page_table[src_row]
+
+        return MLA2D.create_page_table(
+            paged_config=self.paged_config,
+            mesh_device=self.mesh_device,
+            page_table=alias_page_table,
+            batch_size_per_row=int(self.batch_size_per_row / self.mesh_device.shape[0]),
+        )
+
     def _mtp_predict_logits(
         self,
         hidden_states: torch.Tensor | ttnn.Tensor,
         tokens_step: torch.Tensor,
         positions: torch.Tensor,
+        page_table: ttnn.Tensor | None = None,
     ) -> torch.Tensor:
         assert self.enable_mtp, "MTP path requested while MTP is disabled"
         assert tokens_step.dim() == 1, "tokens_step must be [B]"
@@ -791,7 +871,7 @@ class DeepseekGenerator:
 
         rot_idxs = self.rope_setup.get_rot_idxs(positions)
         rope_tensors = self.rope_setup.get_rot_mats_from_rot_idxs(rot_idxs)
-        mtp_page_table = self._get_mtp_page_table()
+        mtp_page_table = page_table if page_table is not None else self._get_mtp_page_table()
         logits_tt = RowBatchedModel.forward_mtp_decode(
             hidden_states=tt_hidden,
             token_ids=tt_tokens,
@@ -998,7 +1078,8 @@ class DeepseekGenerator:
                     for i, last_hidden in enumerate(prefill_last_hidden):
                         if last_hidden is not None:
                             hidden_tail[i] = last_hidden
-                    positions_tail = lengths.clone()
+                    bootstrap_pos_delta = int(os.getenv("DEEPSEEK_MTP_BOOTSTRAP_POS_DELTA", "0"))
+                    positions_tail = lengths.clone() + bootstrap_pos_delta
                     spec_logits = self._mtp_predict_logits(
                         hidden_states=hidden_tail,
                         tokens_step=next_tokens,
@@ -1029,6 +1110,8 @@ class DeepseekGenerator:
                     generated_counts = torch.zeros((num_of_users,), dtype=torch.int32)
                     generated_counts[prompt_mask] = 1
                     verify_offset = num_of_prompts
+                    mtp_verify_page_tables = self._build_mtp_verify_page_tables(num_of_prompts, verify_offset)
+                    mtp_verify_mtp_page_table = self._build_mtp_verify_mtp_page_table(num_of_prompts, verify_offset)
 
                     if spec_tokens is None:
                         raise RuntimeError("MTP spec tokens were not initialized; prefill hidden states missing.")
@@ -1061,6 +1144,7 @@ class DeepseekGenerator:
                             tokens_step=batched_tokens,
                             positions=batched_positions,
                             batch_size_per_row=self.batch_size_per_row,
+                            page_tables=mtp_verify_page_tables,
                             return_hidden=True,
                         )
                         logits_2b = ttnn.to_torch(
@@ -1203,17 +1287,19 @@ class DeepseekGenerator:
 
                         tokens_for_spec = next_tokens.clone()
                         positions_for_spec = positions.clone()
+                        spec_pos_delta = int(os.getenv("DEEPSEEK_MTP_SPEC_POS_DELTA", "1"))
                         # For MTP: hidden[t] + token[t+1] -> predict token[t+2]
                         tokens_for_spec[:num_of_prompts] = pred_next
-                        positions_for_spec[:num_of_prompts] = positions_before[:num_of_prompts] + 1
+                        positions_for_spec[:num_of_prompts] = positions_before[:num_of_prompts] + spec_pos_delta
                         tokens_for_spec[verify_offset : verify_offset + num_of_prompts] = pred_after_spec
                         positions_for_spec[verify_offset : verify_offset + num_of_prompts] = (
-                            positions_before[:num_of_prompts] + 2
+                            positions_before[:num_of_prompts] + spec_pos_delta + 1
                         )
                         spec_logits_full = self._mtp_predict_logits(
                             hidden_states=hidden_2b_tt,
                             tokens_step=tokens_for_spec,
                             positions=positions_for_spec,
+                            page_table=mtp_verify_mtp_page_table,
                         )
                         self.ccl.reset_sem_counters()
                         spec_all = self._sample_greedy(spec_logits_full)
@@ -1221,8 +1307,15 @@ class DeepseekGenerator:
 
                         spec_tokens_next = spec_all[:num_of_prompts]
                         spec_tokens_after_spec = spec_all[verify_offset : verify_offset + num_of_prompts]
-                        spec_tokens = spec_tokens_next.clone()
-                        spec_tokens[accepted_prompt_mask] = spec_tokens_after_spec[accepted_prompt_mask]
+                        if os.getenv("DEEPSEEK_MTP_NO_VERIFY_HIDDEN", "0") == "1":
+                            spec_tokens = spec_tokens_next
+                        else:
+                            spec_tokens = spec_tokens_next.clone()
+                            spec_tokens[accepted_prompt_mask] = spec_tokens_after_spec[accepted_prompt_mask]
+
+                    for pt in mtp_verify_page_tables:
+                        ttnn.deallocate(pt)
+                    ttnn.deallocate(mtp_verify_mtp_page_table)
 
                     if total_verifies > 0:
                         mtp_accept_rate = total_accepts / total_verifies
@@ -1442,36 +1535,19 @@ class DeepseekGenerator:
             # Prime MTP cache for this user using prompt tokens.
             mtp_page_table = self._get_mtp_page_table()
             full_seq_len = int(hidden_tt.shape[2])
-            if full_seq_len > 0 and prompt_len is not None and prompt_len > 1:
-                # MTP prefill needs token[t+1] with hidden[t]. Pad only after the last real shifted token.
-                actual_len = min(int(prompt_len), full_seq_len)
-                shifted_len = max(actual_len - 1, 0)
-                if shifted_len > 0:
-                    # Use the local seq length from hidden_tt to stay consistent with sharded prefill output.
-                    aligned_len = int(full_seq_len)
-                    shifted_len = min(shifted_len, aligned_len)
-                    # Shift hidden/tokens by one position so token[t+1] is stored at cache position t+1.
+            if os.getenv("DEEPSEEK_MTP_SKIP_PREFILL", "0") == "1":
+                logger.info("Skipping MTP prefill priming (DEEPSEEK_MTP_SKIP_PREFILL=1).")
+            elif full_seq_len > 0 and prompt_len is not None and prompt_len > 1:
+                # Prime MTP cache with aligned pairs: hidden[t] + token[t+1].
+                # Use padded full_seq_len so reduce_scatter tiling remains ring-size compatible.
+                aligned_len = int(full_seq_len)
+                if aligned_len > 0:
+                    hidden_shifted = ttnn.clone(hidden_tt)
                     pad_id = self._get_pad_id()
+                    tokens_shifted_host = tokens[:, :, :aligned_len].clone()
                     if aligned_len > 1:
-                        hidden_body = ttnn.slice(hidden_tt, [0, 0, 0, 0], [1, 1, aligned_len - 1, hidden_tt.shape[3]])
-                        hidden_first = ttnn.slice(hidden_tt, [0, 0, 0, 0], [1, 1, 1, hidden_tt.shape[3]])
-                        dummy_hidden = ttnn.mul(
-                            hidden_first,
-                            0.0,
-                            memory_config=hidden_first.memory_config(),
-                        )
-                        hidden_shifted = ttnn.concat(
-                            [dummy_hidden, hidden_body], dim=2, memory_config=ttnn.DRAM_MEMORY_CONFIG
-                        )
-                        ttnn.deallocate(hidden_first)
-                        ttnn.deallocate(dummy_hidden)
-                        ttnn.deallocate(hidden_body)
-                    else:
-                        hidden_shifted = ttnn.slice(hidden_tt, [0, 0, 0, 0], [1, 1, aligned_len, hidden_tt.shape[3]])
-
-                    tokens_shifted_host = torch.full((1, 1, aligned_len), pad_id, dtype=tokens.dtype)
-                    if shifted_len > 0:
-                        tokens_shifted_host[:, :, 1 : shifted_len + 1] = tokens[:, :, 1:actual_len]
+                        tokens_shifted_host[:, :, :-1] = tokens[:, :, 1:aligned_len]
+                    tokens_shifted_host[:, :, -1] = pad_id
                     tokens_shifted = ttnn.from_torch(
                         tokens_shifted_host,
                         device=self.mesh_device,
@@ -1481,20 +1557,16 @@ class DeepseekGenerator:
                         layout=ttnn.ROW_MAJOR_LAYOUT,
                     )
 
-                    # Use RoPE positions offset by +1 for token[t+1].
+                    # RoPE stays unshifted; only trim to seq_len-1 for the shifted hidden/token pairs.
                     rope_setup_mtp = RotarySetup(
                         device=self.mesh_device,
                         batch_size_per_row=1,
                         hf_config=self.hf_config,
                     )
-                    mtp_rot_mats = rope_setup_mtp.get_rot_mats_table(aligned_len + 1)
-                    cos_matrix = mtp_rot_mats["cos_matrix"]
-                    sin_matrix = mtp_rot_mats["sin_matrix"]
-                    cos_trim = ttnn.slice(cos_matrix, [0, 0, 1, 0], [1, 1, aligned_len + 1, cos_matrix.shape[3]])
-                    sin_trim = ttnn.slice(sin_matrix, [0, 0, 1, 0], [1, 1, aligned_len + 1, sin_matrix.shape[3]])
+                    mtp_rot_mats = rope_setup_mtp.get_rot_mats_table(aligned_len)
                     mtp_rope_tensors = {
-                        "cos_matrix": cos_trim,
-                        "sin_matrix": sin_trim,
+                        "cos_matrix": mtp_rot_mats["cos_matrix"],
+                        "sin_matrix": mtp_rot_mats["sin_matrix"],
                         "trans_matrix": mtp_rot_mats["trans_matrix"],
                     }
 
@@ -1508,8 +1580,6 @@ class DeepseekGenerator:
                     )
                     ttnn.deallocate(hidden_shifted)
                     ttnn.deallocate(tokens_shifted)
-                    ttnn.deallocate(cos_trim)
-                    ttnn.deallocate(sin_trim)
                     ttnn.deallocate(mtp_logits_tt)
                     self.ccl.reset_sem_counters()
 
