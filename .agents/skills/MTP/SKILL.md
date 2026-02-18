@@ -108,3 +108,21 @@ description: Bring up multi-token prediction (speculative decoding) for TTNN tra
   - MTP prefill uses padded `full_seq_len`.
   - Hidden stays unshifted while tokens are left-shifted with tail pad.
   - RoPE slicing/trim length matches the effective MTP prefill sequence exactly.
+
+## Verified Run Snapshot (2026-02-18, patch13)
+- Verified artifacts:
+  - Reference baseline: `logs/deepseek_demo_baseline_f250fa_20260216_195652.json`
+  - MTP off: `logs/deepseek_demo_off_patch13_mnt16_20260218_140532.json`
+  - MTP on: `logs/deepseek_demo_on_patch13_mnt16_20260218_140706.json`
+- Verification outcomes:
+  - Gate 1 (current branch, MTP off vs reference baseline): PASS
+  - Gate 2 (MTP on vs MTP off): PASS
+  - Gate 3 (acceptance threshold): PASS (`54/66 = 0.818`, above `0.5`)
+- Use content-only comparisons for parity checks:
+  - Compare `{prompts, generations[index,prompt,text]}` and ignore runtime statistics fields, which are expected to differ.
+  - Example check:
+    - `jq -S '{prompts, generations: [.generations[] | {index,prompt,text}]}' <json> | diff -u ...`
+- Reference integrity guardrail:
+  - Record baseline hash before/after bring-up checks:
+    - `sha256sum logs/deepseek_demo_baseline_f250fa_20260216_195652.json`
+    - Expected for this run: `043822cc45e3a0b66043dab912e9bd59bffb3c74fb07f5beace169c232816f78`

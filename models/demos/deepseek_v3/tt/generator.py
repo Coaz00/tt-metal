@@ -649,7 +649,7 @@ class DeepseekGenerator:
         assert hasattr(self, "hf_config") and self.hf_config is not None
         batch_per_shard = even_int_div(self.batch_size_per_row, self.dp_factor)
         blocks_per_user = even_int_div(self.paged_config.max_num_blocks, batch_per_shard)
-        self.base_page_table_host = torch.randperm(self.paged_config.max_num_blocks, dtype=torch.int32).reshape(
+        self.base_page_table_host = torch.arange(self.paged_config.max_num_blocks, dtype=torch.int32).reshape(
             batch_per_shard, blocks_per_user
         )
         self.page_tables_tt = tuple(
@@ -673,7 +673,7 @@ class DeepseekGenerator:
 
         batch_per_shard = even_int_div(self.batch_size_per_row, self.dp_factor)
         blocks_per_user = even_int_div(self.paged_config.max_num_blocks, batch_per_shard)
-        self.mtp_page_table_host = torch.randperm(self.paged_config.max_num_blocks, dtype=torch.int32).reshape(
+        self.mtp_page_table_host = torch.arange(self.paged_config.max_num_blocks, dtype=torch.int32).reshape(
             batch_per_shard, blocks_per_user
         )
         self.mtp_page_table_tt = MLA2D.create_page_table(
@@ -771,8 +771,13 @@ class DeepseekGenerator:
         ttnn.deallocate(tt_positions)
         return decode_out
 
-    def _build_mtp_verify_page_tables(self, num_prompts: int, verify_offset: int) -> tuple[ttnn.Tensor, ...]:
-        """Build per-layer page tables where verify lanes alias prompt lanes."""
+    def _build_mtp_verify_page_tables(
+        self,
+        num_prompts: int,
+        verify_offset: int,
+        prompt_indices: List[int] | None = None,
+    ) -> tuple[ttnn.Tensor, ...]:
+        """Build per-layer page tables where selected verify lanes alias prompt lanes."""
         if num_prompts <= 0:
             return self._get_page_tables()
 
@@ -788,7 +793,11 @@ class DeepseekGenerator:
         if num_rows <= 0:
             raise RuntimeError("Page table has zero rows; cannot build MTP verify aliasing.")
 
-        for i in range(num_prompts):
+        if prompt_indices is None:
+            prompt_indices = list(range(num_prompts))
+        for i in prompt_indices:
+            if i < 0 or i >= num_prompts:
+                continue
             src_row = i % num_rows
             dst_row = (verify_offset + i) % num_rows
             alias_page_table[dst_row] = alias_page_table[src_row]
@@ -803,8 +812,13 @@ class DeepseekGenerator:
         ttnn.deallocate(aliased_tt)
         return out
 
-    def _build_mtp_verify_mtp_page_table(self, num_prompts: int, verify_offset: int) -> ttnn.Tensor:
-        """Build an aliased MTP page table where verify lanes alias prompt lanes."""
+    def _build_mtp_verify_mtp_page_table(
+        self,
+        num_prompts: int,
+        verify_offset: int,
+        prompt_indices: List[int] | None = None,
+    ) -> ttnn.Tensor:
+        """Build an aliased MTP page table where selected verify lanes alias prompt lanes."""
         if num_prompts <= 0:
             return ttnn.clone(self._get_mtp_page_table())
 
@@ -820,7 +834,11 @@ class DeepseekGenerator:
         if num_rows <= 0:
             raise RuntimeError("MTP page table has zero rows; cannot build verify aliasing.")
 
-        for i in range(num_prompts):
+        if prompt_indices is None:
+            prompt_indices = list(range(num_prompts))
+        for i in prompt_indices:
+            if i < 0 or i >= num_prompts:
+                continue
             src_row = i % num_rows
             dst_row = (verify_offset + i) % num_rows
             alias_page_table[dst_row] = alias_page_table[src_row]
@@ -922,10 +940,8 @@ class DeepseekGenerator:
         max_len = max(len(t) for t in tokens_list)
         if self.prefill_max_tokens is not None:
             max_len = min(self.prefill_max_tokens, max_len)  # truncate all sequences to the prefill_max_tokens
-        # Round up to nearest multiple of TILE_SIZE. Only expand to ring-size alignment for MTP runs
-        # to avoid long padding affecting baseline logits.
-        ring_size = int(self.mesh_device.shape[0])
-        alignment = ttnn.TILE_SIZE * max(ring_size, 1) if self.enable_mtp else ttnn.TILE_SIZE
+        # Round up to nearest multiple of TILE_SIZE.
+        alignment = ttnn.TILE_SIZE
         max_len = ((max_len + alignment - 1) // alignment) * alignment
 
         pad_id = self._get_pad_id()
@@ -993,6 +1009,7 @@ class DeepseekGenerator:
         logger.info(f"Lengths of {lengths.shape} (encoded) prompts: {lengths}")
         decode_steps_for_stats = 0
         num_of_users = tokens_batched.shape[0]
+        token_trace = bool(int(os.getenv("DEEPSEEK_TOKEN_TRACE", "0")))
         use_mtp_path = self.enable_mtp and teacher_forcing is None and (not self.enable_trace) and max_new_tokens > 1
         if use_mtp_path and 2 * num_of_prompts > num_of_users:
             logger.warning(
@@ -1000,6 +1017,12 @@ class DeepseekGenerator:
                 "falling back to regular decode path."
             )
             use_mtp_path = False
+        if use_mtp_path and num_of_prompts > 0:
+            # Prefill verify lanes with the same prompt contexts as active lanes so verify decode
+            # reads from matching caches instead of empty padded users.
+            verify_offset_boot = num_of_prompts
+            tokens_batched[verify_offset_boot : verify_offset_boot + num_of_prompts] = tokens_batched[:num_of_prompts]
+            lengths[verify_offset_boot : verify_offset_boot + num_of_prompts] = lengths[:num_of_prompts]
 
         # Run one or more prefill+decode batches
         for _ in range(repeat_batches):
@@ -1092,6 +1115,8 @@ class DeepseekGenerator:
                 for i in range(num_of_prompts):
                     token_value = int(next_tokens[i].item())
                     generations[i].append(token_value)
+                    if token_trace:
+                        logger.info(f"TOKTRACE prompt={i} gen_idx=0 token={token_value}")
                     if early_print_first_user and i == 0:
                         if self.tokenizer is not None:
                             print(self.tokenizer.decode(token_value, skip_special_tokens=True), end="", flush=True)
@@ -1109,9 +1134,15 @@ class DeepseekGenerator:
                     prompt_mask = torch.arange(num_of_users) < num_of_prompts
                     generated_counts = torch.zeros((num_of_users,), dtype=torch.int32)
                     generated_counts[prompt_mask] = 1
-                    verify_offset = num_of_prompts
-                    mtp_verify_page_tables = self._build_mtp_verify_page_tables(num_of_prompts, verify_offset)
-                    mtp_verify_mtp_page_table = self._build_mtp_verify_mtp_page_table(num_of_prompts, verify_offset)
+                    verify_offset = int(os.getenv("DEEPSEEK_MTP_VERIFY_OFFSET", str(num_of_prompts)))
+                    if verify_offset < num_of_prompts or verify_offset + num_of_prompts > num_of_users:
+                        raise RuntimeError(
+                            f"Invalid DEEPSEEK_MTP_VERIFY_OFFSET={verify_offset} for "
+                            f"num_prompts={num_of_prompts}, num_users={num_of_users}"
+                        )
+                    decode_page_tables = self._build_mtp_verify_page_tables(
+                        num_prompts=num_of_prompts, verify_offset=verify_offset
+                    )
 
                     if spec_tokens is None:
                         raise RuntimeError("MTP spec tokens were not initialized; prefill hidden states missing.")
@@ -1144,7 +1175,7 @@ class DeepseekGenerator:
                             tokens_step=batched_tokens,
                             positions=batched_positions,
                             batch_size_per_row=self.batch_size_per_row,
-                            page_tables=mtp_verify_page_tables,
+                            page_tables=decode_page_tables,
                             return_hidden=True,
                         )
                         logits_2b = ttnn.to_torch(
@@ -1172,6 +1203,10 @@ class DeepseekGenerator:
                             next_value = int(pred_next[i].item())
                             generations[i].append(next_value)
                             generated_counts[i] += 1
+                            if token_trace:
+                                logger.info(
+                                    f"TOKTRACE prompt={i} gen_idx={int(generated_counts[i].item())-1} token={next_value}"
+                                )
                             if early_print_first_user and i == 0:
                                 if self.tokenizer is not None:
                                     print(
@@ -1187,9 +1222,60 @@ class DeepseekGenerator:
                             if accepted and generated_counts[i] < max_new_tokens:
                                 accepted_prompt_mask[i] = True
                                 total_accepts += 1
-                                after_spec_value = int(pred_after_spec[i].item())
+                            next_tokens[i] = next_value
+                            positions[i] = positions[i] + 1
+
+                        accepted_indices = [
+                            i
+                            for i in range(num_of_prompts)
+                            if accepted_prompt_mask[i] and generated_counts[i] < max_new_tokens
+                        ]
+                        spec_from_accepted = None
+                        if accepted_indices:
+                            accepted_tokens = next_tokens.clone()
+                            accepted_positions = positions.clone()
+                            for i in accepted_indices:
+                                accepted_tokens[i] = pred_next[i]
+                                accepted_positions[i] = positions_before[i] + 1
+
+                            logits_acc_tt, hidden_acc_tt = self._decode_step_tt(
+                                tokens_step=accepted_tokens,
+                                positions=accepted_positions,
+                                batch_size_per_row=self.batch_size_per_row,
+                                page_tables=decode_page_tables,
+                                return_hidden=True,
+                            )
+                            logits_acc = ttnn.to_torch(
+                                logits_acc_tt,
+                                mesh_composer=ttnn.ConcatMesh2dToTensor(
+                                    self.mesh_device, dims=(-2, -1), mesh_shape=self.mesh_device.shape
+                                ),
+                            )
+                            ttnn.deallocate(logits_acc_tt)
+                            self.ccl.reset_sem_counters()
+                            preds_acc = self._sample_greedy(logits_acc.squeeze(0).squeeze(0))
+                            pred_after_true = preds_acc[:num_of_prompts]
+                            tokens_for_spec_acc = next_tokens.clone()
+                            positions_for_spec_acc = positions.clone()
+                            for i in accepted_indices:
+                                tokens_for_spec_acc[i] = pred_after_true[i]
+                                positions_for_spec_acc[i] = positions_before[i] + 2
+                            spec_logits_acc = self._mtp_predict_logits(
+                                hidden_states=hidden_acc_tt,
+                                tokens_step=tokens_for_spec_acc,
+                                positions=positions_for_spec_acc,
+                            )
+                            spec_from_accepted = self._sample_greedy(spec_logits_acc)[:num_of_prompts]
+                            ttnn.deallocate(hidden_acc_tt)
+                            self.ccl.reset_sem_counters()
+                            for i in accepted_indices:
+                                after_spec_value = int(pred_after_true[i].item())
                                 generations[i].append(after_spec_value)
                                 generated_counts[i] += 1
+                                if token_trace:
+                                    logger.info(
+                                        f"TOKTRACE prompt={i} gen_idx={int(generated_counts[i].item())-1} token={after_spec_value}"
+                                    )
                                 if early_print_first_user and i == 0:
                                     if self.tokenizer is not None:
                                         print(
@@ -1199,12 +1285,8 @@ class DeepseekGenerator:
                                         )
                                     else:
                                         print(f"{after_spec_value} ", end="", flush=True)
-
                                 next_tokens[i] = after_spec_value
-                                positions[i] = positions[i] + 2
-                            else:
-                                next_tokens[i] = next_value
-                                positions[i] = positions[i] + 1
+                                positions[i] = positions_before[i] + 2
 
                         if debug_mtp and debug_mtp_step_idx < debug_mtp_steps:
                             debug_mtp_step_idx += 1
@@ -1287,35 +1369,22 @@ class DeepseekGenerator:
 
                         tokens_for_spec = next_tokens.clone()
                         positions_for_spec = positions.clone()
-                        spec_pos_delta = int(os.getenv("DEEPSEEK_MTP_SPEC_POS_DELTA", "1"))
                         # For MTP: hidden[t] + token[t+1] -> predict token[t+2]
                         tokens_for_spec[:num_of_prompts] = pred_next
-                        positions_for_spec[:num_of_prompts] = positions_before[:num_of_prompts] + spec_pos_delta
-                        tokens_for_spec[verify_offset : verify_offset + num_of_prompts] = pred_after_spec
-                        positions_for_spec[verify_offset : verify_offset + num_of_prompts] = (
-                            positions_before[:num_of_prompts] + spec_pos_delta + 1
-                        )
+                        positions_for_spec[:num_of_prompts] = positions_before[:num_of_prompts] + 1
                         spec_logits_full = self._mtp_predict_logits(
                             hidden_states=hidden_2b_tt,
                             tokens_step=tokens_for_spec,
                             positions=positions_for_spec,
-                            page_table=mtp_verify_mtp_page_table,
                         )
                         self.ccl.reset_sem_counters()
                         spec_all = self._sample_greedy(spec_logits_full)
                         ttnn.deallocate(hidden_2b_tt)
 
                         spec_tokens_next = spec_all[:num_of_prompts]
-                        spec_tokens_after_spec = spec_all[verify_offset : verify_offset + num_of_prompts]
-                        if os.getenv("DEEPSEEK_MTP_NO_VERIFY_HIDDEN", "0") == "1":
-                            spec_tokens = spec_tokens_next
-                        else:
-                            spec_tokens = spec_tokens_next.clone()
-                            spec_tokens[accepted_prompt_mask] = spec_tokens_after_spec[accepted_prompt_mask]
-
-                    for pt in mtp_verify_page_tables:
-                        ttnn.deallocate(pt)
-                    ttnn.deallocate(mtp_verify_mtp_page_table)
+                        spec_tokens = spec_tokens_next
+                        if spec_from_accepted is not None:
+                            spec_tokens[accepted_prompt_mask] = spec_from_accepted[accepted_prompt_mask]
 
                     if total_verifies > 0:
                         mtp_accept_rate = total_accepts / total_verifies
@@ -1359,6 +1428,10 @@ class DeepseekGenerator:
                         for i in range(num_of_prompts):
                             token_value = int(next_tokens[i].item())
                             generations[i].append(token_value)
+                            if token_trace:
+                                logger.info(
+                                    f"TOKTRACE prompt={i} gen_idx={len(generations[i]) - 1} token={token_value}"
+                                )
                             if early_print_first_user and i == 0:
                                 if self.tokenizer is not None:
                                     print(
@@ -1539,15 +1612,27 @@ class DeepseekGenerator:
                 logger.info("Skipping MTP prefill priming (DEEPSEEK_MTP_SKIP_PREFILL=1).")
             elif full_seq_len > 0 and prompt_len is not None and prompt_len > 1:
                 # Prime MTP cache with aligned pairs: hidden[t] + token[t+1].
-                # Use padded full_seq_len so reduce_scatter tiling remains ring-size compatible.
-                aligned_len = int(full_seq_len)
+                # Keep base prefill parity-safe, then pad only the MTP priming sequence so
+                # reduce_scatter sees a ring-compatible tile count.
+                ring_size = int(self.mesh_device.shape[0])
+                mtp_alignment = ttnn.TILE_SIZE * max(ring_size, 1)
+                aligned_len = ((int(full_seq_len) + mtp_alignment - 1) // mtp_alignment) * mtp_alignment
                 if aligned_len > 0:
-                    hidden_shifted = ttnn.clone(hidden_tt)
+                    hidden_shifted_base = ttnn.clone(hidden_tt)
+                    if aligned_len > full_seq_len:
+                        hidden_shifted = ttnn.pad(
+                            hidden_shifted_base,
+                            padding=((0, 0), (0, 0), (0, aligned_len - full_seq_len), (0, 0)),
+                            value=0.0,
+                        )
+                        ttnn.deallocate(hidden_shifted_base)
+                    else:
+                        hidden_shifted = hidden_shifted_base
+
                     pad_id = self._get_pad_id()
-                    tokens_shifted_host = tokens[:, :, :aligned_len].clone()
-                    if aligned_len > 1:
-                        tokens_shifted_host[:, :, :-1] = tokens[:, :, 1:aligned_len]
-                    tokens_shifted_host[:, :, -1] = pad_id
+                    tokens_shifted_host = torch.full((1, 1, aligned_len), pad_id, dtype=tokens.dtype)
+                    if full_seq_len > 1:
+                        tokens_shifted_host[:, :, : full_seq_len - 1] = tokens[:, :, 1:full_seq_len]
                     tokens_shifted = ttnn.from_torch(
                         tokens_shifted_host,
                         device=self.mesh_device,

@@ -39,4 +39,4 @@ on_failure: |
 tear_down: |
   Nothing to tear down.
 
-max_iterations: 2  # Optional (default is 10). 0 means unlimited.
+max_iterations: 20  # Optional (default is 10). 0 means unlimited.
