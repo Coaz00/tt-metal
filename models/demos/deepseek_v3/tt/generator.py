@@ -1131,7 +1131,7 @@ class DeepseekGenerator:
                 debug_mtp_steps = int(os.getenv("DEEPSEEK_MTP_DEBUG_STEPS", "3"))
                 debug_mtp_step_idx = 0
                 if use_mtp_path:
-                    skip_accept_decode = bool(int(os.getenv("DEEPSEEK_MTP_SKIP_ACCEPT_DECODE", "1")))
+                    skip_accept_decode = True
                     prompt_mask = torch.arange(num_of_users) < num_of_prompts
                     generated_counts = torch.zeros((num_of_users,), dtype=torch.int32)
                     generated_counts[prompt_mask] = 1
@@ -1232,65 +1232,8 @@ class DeepseekGenerator:
                             for i in range(num_of_prompts)
                             if accepted_prompt_mask[i] and generated_counts[i] < max_new_tokens
                         ]
-                        spec_from_accepted = None
                         if skip_accept_decode and accepted_indices:
                             skipped_decode_tokens += len(accepted_indices)
-                        elif accepted_indices:
-                            accepted_tokens = next_tokens.clone()
-                            accepted_positions = positions.clone()
-                            for i in accepted_indices:
-                                accepted_tokens[i] = pred_next[i]
-                                accepted_positions[i] = positions_before[i] + 1
-
-                            logits_acc_tt, hidden_acc_tt = self._decode_step_tt(
-                                tokens_step=accepted_tokens,
-                                positions=accepted_positions,
-                                batch_size_per_row=self.batch_size_per_row,
-                                page_tables=decode_page_tables,
-                                return_hidden=True,
-                            )
-                            logits_acc = ttnn.to_torch(
-                                logits_acc_tt,
-                                mesh_composer=ttnn.ConcatMesh2dToTensor(
-                                    self.mesh_device, dims=(-2, -1), mesh_shape=self.mesh_device.shape
-                                ),
-                            )
-                            ttnn.deallocate(logits_acc_tt)
-                            self.ccl.reset_sem_counters()
-                            preds_acc = self._sample_greedy(logits_acc.squeeze(0).squeeze(0))
-                            pred_after_true = preds_acc[:num_of_prompts]
-                            tokens_for_spec_acc = next_tokens.clone()
-                            positions_for_spec_acc = positions.clone()
-                            for i in accepted_indices:
-                                tokens_for_spec_acc[i] = pred_after_true[i]
-                                positions_for_spec_acc[i] = positions_before[i] + 2
-                            spec_logits_acc = self._mtp_predict_logits(
-                                hidden_states=hidden_acc_tt,
-                                tokens_step=tokens_for_spec_acc,
-                                positions=positions_for_spec_acc,
-                            )
-                            spec_from_accepted = self._sample_greedy(spec_logits_acc)[:num_of_prompts]
-                            ttnn.deallocate(hidden_acc_tt)
-                            self.ccl.reset_sem_counters()
-                            for i in accepted_indices:
-                                after_spec_value = int(pred_after_true[i].item())
-                                generations[i].append(after_spec_value)
-                                generated_counts[i] += 1
-                                if token_trace:
-                                    logger.info(
-                                        f"TOKTRACE prompt={i} gen_idx={int(generated_counts[i].item())-1} token={after_spec_value}"
-                                    )
-                                if early_print_first_user and i == 0:
-                                    if self.tokenizer is not None:
-                                        print(
-                                            self.tokenizer.decode(after_spec_value, skip_special_tokens=True),
-                                            end="",
-                                            flush=True,
-                                        )
-                                    else:
-                                        print(f"{after_spec_value} ", end="", flush=True)
-                                next_tokens[i] = after_spec_value
-                                positions[i] = positions_before[i] + 2
 
                         if debug_mtp and debug_mtp_step_idx < debug_mtp_steps:
                             debug_mtp_step_idx += 1
@@ -1387,8 +1330,6 @@ class DeepseekGenerator:
 
                         spec_tokens_next = spec_all[:num_of_prompts]
                         spec_tokens = spec_tokens_next
-                        if spec_from_accepted is not None and not skip_accept_decode:
-                            spec_tokens[accepted_prompt_mask] = spec_from_accepted[accepted_prompt_mask]
 
                     if total_verifies > 0:
                         mtp_accept_rate = total_accepts / total_verifies
