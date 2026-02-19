@@ -1353,7 +1353,7 @@ TEST_F(HDSocketFixture, D2HSocketLatencyBenchmark) {
     std::cout.flush();
 }
 
-// Helper function for benchmark that returns results without printing extra info
+// Returns per-page latency in microseconds and cycles.
 std::pair<double, double> benchmark_d2h_socket(
     const std::shared_ptr<tt::tt_metal::distributed::MeshDevice>& mesh_device,
     std::size_t socket_fifo_size,
