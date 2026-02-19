@@ -108,6 +108,16 @@ description: Bring up multi-token prediction (speculative decoding) for TTNN tra
   - MTP prefill uses padded `full_seq_len`.
   - Hidden stays unshifted while tokens are left-shifted with tail pad.
   - RoPE slicing/trim length matches the effective MTP prefill sequence exactly.
+- If full demo runs stall right after `Creating model shared states...` with no log growth:
+  - Confirm staleness with `stat` on the active log/json before waiting indefinitely.
+  - Stop the run and clear stale launcher processes (`pkill -f demo.py`/`prterun`) before retrying.
+  - A `reset.sh` run may reinitialize boards successfully but still end with `test_system_health` missing; treat this as a tooling issue, not necessarily a failed hardware reset.
+  - Use the most recent completed OFF/ON artifact pair for parity/acceptance gates if reruns are blocked by this stall signature.
+- Trace-mode gotchas seen in this bring-up:
+  - Default trace region sizing can trigger mailbox-level TT_FATAL on this workload; allow runtime override (for example `DEEPSEEK_TRACE_REGION_SIZE=134217728`).
+  - Removing decode warm-up before trace capture can trigger `TT_FATAL: Writes are not supported during trace capture`.
+  - A naive warm-up decode on real page tables can mutate decode cache state and break output parity.
+  - An isolated warm-up routed to a non-prompt cache row can stabilize capture/hangs, but parity still needs explicit token-level validation.
 
 ## Verified Run Snapshot (2026-02-18, patch13)
 - Verified artifacts:

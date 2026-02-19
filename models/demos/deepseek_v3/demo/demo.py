@@ -397,7 +397,7 @@ def run_demo(
                 prompt_list = prompts
 
         # Multi-prompt generation
-        use_mtp_path = gen.enable_mtp and token_acc is None and (not gen.enable_trace) and max_new_tokens > 1
+        use_mtp_path = gen.enable_mtp and token_acc is None and max_new_tokens > 1
         max_prompts_per_batch = gen.batch_size
         if use_mtp_path:
             max_prompts_per_batch = max(1, gen.batch_size // 2)

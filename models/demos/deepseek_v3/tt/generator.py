@@ -1010,7 +1010,7 @@ class DeepseekGenerator:
         decode_steps_for_stats = 0
         num_of_users = tokens_batched.shape[0]
         token_trace = bool(int(os.getenv("DEEPSEEK_TOKEN_TRACE", "0")))
-        use_mtp_path = self.enable_mtp and teacher_forcing is None and (not self.enable_trace) and max_new_tokens > 1
+        use_mtp_path = self.enable_mtp and teacher_forcing is None and max_new_tokens > 1
         if use_mtp_path and 2 * num_of_prompts > num_of_users:
             logger.warning(
                 f"MTP verify batching needs 2x prompt lanes ({2 * num_of_prompts}) but only {num_of_users} are available; "
