@@ -1283,7 +1283,7 @@ TEST_F(HDSocketFixture, D2HSocketLatencyBenchmark) {
         1024UL * 1024 * 1024  // 1GB
     };
 
-    std::vector<std::size_t> page_sizes = {64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384};
+    std::vector<std::size_t> page_sizes = {64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768};
     std::vector<std::size_t> fifo_sizes = {
         1024,
         2048,
@@ -1425,6 +1425,9 @@ std::pair<double, double> benchmark_d2h_socket(
         }
     }
     output_socket.barrier();
+    // Ensure the launched program has fully completed and flushed measurement writes
+    // before reading measurement_buffer from host.
+    Finish(mesh_device->mesh_command_queue());
 
     const auto& cluster = MetalContext::instance().get_cluster();
     std::vector<uint64_t> latency_data(1);

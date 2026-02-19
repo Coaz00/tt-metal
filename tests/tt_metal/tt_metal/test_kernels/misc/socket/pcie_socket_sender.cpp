@@ -26,6 +26,7 @@ void kernel_main() {
     uint64_t pcie_base_addr = (static_cast<uint64_t>(data_addr_hi) << 32) | sender_socket.downstream_fifo_addr;
 
     uint64_t start_timestamp = get_timestamp();
+    constexpr uint32_t max_noc_burst_bytes = NOC_MAX_BURST_SIZE;
 
     for (uint32_t i = 0; i < num_iterations; i++) {
         uint32_t data_addr = local_l1_buffer_addr;
