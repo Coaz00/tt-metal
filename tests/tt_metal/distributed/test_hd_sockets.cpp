@@ -1283,7 +1283,7 @@ TEST_F(HDSocketFixture, D2HSocketLatencyBenchmark) {
         1024UL * 1024 * 1024  // 1GB
     };
 
-    std::vector<std::size_t> page_sizes = {64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768};
+    std::vector<std::size_t> page_sizes = {64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536};
     std::vector<std::size_t> fifo_sizes = {
         1024,
         2048,

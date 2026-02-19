@@ -22,6 +22,7 @@ void kernel_main() {
     uint64_t pcie_data_addr = (static_cast<uint64_t>(receiver_socket.h2d.data_addr_hi) << 32) |
                               (static_cast<uint64_t>(receiver_socket.h2d.data_addr_lo));
     uint32_t pcie_xy_enc = receiver_socket.h2d.pcie_xy_enc;
+    constexpr uint32_t max_noc_burst_bytes = NOC_MAX_BURST_SIZE;
 
     uint64_t start_timestamp = get_timestamp();
 
