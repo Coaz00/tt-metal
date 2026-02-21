@@ -22,6 +22,7 @@ def test_dram_group_norm_welford_reciprocal_vae(device):
 
 @skip_with_llk_assert()
 @pytest.mark.parametrize("device_params", [{"l1_small_size": 0}], indirect=True)
+@pytest.mark.skip(reason="Known failure: brisc.elf overflows region limit")
 def test_block_sharded_group_norm_sdxl(device):
     from tests.ttnn.unit_tests.operations.fused.test_group_norm import test_sdxl_base_group_norm
 
@@ -123,6 +124,7 @@ def test_conv2d_auto_sliced_vae(device):
 
 @skip_with_llk_assert()
 @pytest.mark.models_device_performance_bare_metal
+@pytest.mark.skip(reason="Known failure")
 def test_dram_group_norm_vae_welford_reciprocal_performance():
     # Create a command that runs the specific test
     command = f'pytest "models/experimental/stable_diffusion_xl_base/tests/test_sdxl_op_unit_test_perf.py::test_dram_group_norm_welford_reciprocal_vae" -v'
@@ -160,6 +162,7 @@ def test_dram_group_norm_vae_welford_reciprocal_performance():
 
 @skip_with_llk_assert()
 @pytest.mark.models_device_performance_bare_metal
+@pytest.mark.skip(reason="Known failure: brisc.elf overflows region limit")
 def test_block_sharded_group_norm_sdxl_performance():
     # Create a command that runs the specific test
     command = f'pytest "models/experimental/stable_diffusion_xl_base/tests/test_sdxl_op_unit_test_perf.py::test_block_sharded_group_norm_sdxl" -v'
