@@ -104,32 +104,32 @@ on:
         description: "Enable Link Time Optimization (LTO)"
       run-ttnn-unit-tests:
         required: false
-        default: true
+        default: false
         type: boolean
         description: "Run TTNN unit tests"
       run-models-unit-tests:
         required: false
-        default: false
+        default: true
         type: boolean
         description: "Run model unit tests"
       run-tt-train-cpp-unit-tests:
         required: false
-        default: true
+        default: false
         type: boolean
         description: "Run TT-Train C++ unit tests"
       run-profiler-regression:
         required: false
-        default: false
+        default: true
         type: boolean
         description: "Run profiler regression tests"
       run-t3000-apc-fast-tests:
         required: false
-        default: false
+        default: true
         type: boolean
         description: "Run T3000 APC fast tests"
       run-ops-unit-tests:
         required: false
-        default: true
+        default: false
         type: boolean
         description: "Run ops unit tests"
       enable-watcher:
