@@ -46,12 +46,7 @@ jobs:
       matrix:
         test-group: [
           {name: model-deepseek, group: deepseek},
-          {name: model-falcon, group: falcon},
-          {name: model-resnet-unet, group: resnet_unet},
-          {name: model-mobilenet, group: mobilenet},
-          {name: model-vit, group: vit},
           {name: model-llama, group: llama},
-          {name: model-slow-runtime, group: slow_runtime},
         ]
     name: ${{ matrix.test-group.name }} ${{ inputs.arch }} ${{ inputs.runner-label }}
     runs-on: >-

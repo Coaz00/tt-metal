@@ -22,8 +22,11 @@
 #include "internal/circular_buffer_interface.h"
 
 #include "internal/debug/watcher_common.h"
+#include "internal/debug/sanitize.h"
 #include "api/debug/waypoint.h"
+#ifndef TT_METAL_LIGHTWEIGHT_KERNEL_ASSERTS
 #include "internal/debug/stack_usage.h"
+#endif
 
 uint8_t noc_index;
 
@@ -48,13 +51,6 @@ uint8_t my_logical_x_ __attribute__((used));
 uint8_t my_logical_y_ __attribute__((used));
 uint8_t my_relative_x_ __attribute__((used));
 uint8_t my_relative_y_ __attribute__((used));
-
-// These arrays are stored in local memory of FW, but primarily used by the kernel which shares
-// FW symbols. Hence mark these as 'used' so that FW compiler doesn't optimize it out.
-uint16_t dram_bank_to_noc_xy[NUM_NOCS][NUM_DRAM_BANKS] __attribute__((used));
-uint16_t l1_bank_to_noc_xy[NUM_NOCS][NUM_L1_BANKS] __attribute__((used));
-int32_t bank_to_dram_offset[NUM_DRAM_BANKS] __attribute__((used));
-int32_t bank_to_l1_offset[NUM_L1_BANKS] __attribute__((used));
 
 // c_tensix_core core;
 
@@ -116,10 +112,12 @@ int main() {
     do_crt1((uint32_t*)MEM_IERISC_INIT_LOCAL_L1_BASE_SCRATCH);
     uint32_t heartbeat = 0;
 
-    noc_bank_table_init(MEM_IERISC_BANK_TO_NOC_SCRATCH);
-
     my_logical_x_ = mailboxes->core_info.absolute_logical_x;
     my_logical_y_ = mailboxes->core_info.absolute_logical_y;
+
+#ifndef TT_METAL_LIGHTWEIGHT_KERNEL_ASSERTS
+    noc_bank_table_init(MEM_IERISC_BANK_TO_NOC_SCRATCH);
+#endif
 
     risc_init();
 
@@ -140,9 +138,10 @@ int main() {
     wait_subordinate_eriscs(heartbeat);
     mailboxes->go_messages[0].signal = RUN_MSG_DONE;
     mailboxes->launch_msg_rd_ptr = 0;  // Initialize the rdptr to 0
-    // Cleanup profiler buffer incase we never get the go message
 
+#if !defined(TT_METAL_LIGHTWEIGHT_KERNEL_ASSERTS) && defined(PROFILE_KERNEL)
     DeviceProfilerInit();
+#endif
     while (1) {
         // Wait...
         WAYPOINT("GW");
@@ -155,10 +154,14 @@ int main() {
         {
             // Idle ERISC Kernels aren't given go-signals corresponding to empty launch messages. Always profile this
             // iteration, since it's guaranteed to be valid.
+#if !defined(TT_METAL_LIGHTWEIGHT_KERNEL_ASSERTS) && defined(PROFILE_KERNEL)
             DeviceZoneScopedMainN("ERISC-IDLE-FW");
+#endif
             uint32_t launch_msg_rd_ptr = mailboxes->launch_msg_rd_ptr;
             launch_msg_t* launch_msg_address = &(mailboxes->launch[launch_msg_rd_ptr]);
+#if !defined(TT_METAL_LIGHTWEIGHT_KERNEL_ASSERTS) && defined(PROFILE_KERNEL)
             DeviceZoneSetCounter(launch_msg_address->kernel_config.host_assigned_id);
+#endif
 
             noc_index = launch_msg_address->kernel_config.brisc_noc_id;
             my_relative_x_ = my_logical_x_ - launch_msg_address->kernel_config.sub_device_origin_x;
@@ -178,8 +181,12 @@ int main() {
                 WAYPOINT("R");
                 uint32_t kernel_lma =
                     (kernel_config_base + launch_msg_address->kernel_config.kernel_text_offset[index]);
+#ifndef TT_METAL_LIGHTWEIGHT_KERNEL_ASSERTS
                 auto stack_free = reinterpret_cast<uint32_t (*)()>(kernel_lma)();
                 record_stack_usage(stack_free);
+#else
+                reinterpret_cast<void (*)()>(kernel_lma)();
+#endif
                 WAYPOINT("D");
             }
 
@@ -191,8 +198,10 @@ int main() {
             if (launch_msg_address->kernel_config.mode == DISPATCH_MODE_DEV) {
                 launch_msg_address->kernel_config.enables = 0;
                 uint64_t dispatch_addr = calculate_dispatch_addr(&mailboxes->go_messages[0]);
+#if !defined(TT_METAL_LIGHTWEIGHT_KERNEL_ASSERTS) && defined(WATCHER_ENABLED)
                 DEBUG_SANITIZE_NOC_ADDR(noc_index, dispatch_addr, 4);
                 CLEAR_PREVIOUS_LAUNCH_MESSAGE_ENTRY_FOR_WATCHER();
+#endif
                 notify_dispatch_core_done(dispatch_addr, noc_index);
                 mailboxes->launch_msg_rd_ptr = (launch_msg_rd_ptr + 1) & (launch_msg_buffer_num_entries - 1);
             }
