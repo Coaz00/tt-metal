@@ -52,12 +52,14 @@ uint8_t my_logical_y_ __attribute__((used));
 uint8_t my_relative_x_ __attribute__((used));
 uint8_t my_relative_y_ __attribute__((used));
 
+#ifndef TT_METAL_LIGHTWEIGHT_KERNEL_ASSERTS
 // These arrays are stored in local memory of FW, but primarily used by the kernel which shares
 // FW symbols. Hence mark these as 'used' so that FW compiler doesn't optimize it out.
 uint16_t dram_bank_to_noc_xy[NUM_NOCS][NUM_DRAM_BANKS] __attribute__((used));
 uint16_t l1_bank_to_noc_xy[NUM_NOCS][NUM_L1_BANKS] __attribute__((used));
 int32_t bank_to_dram_offset[NUM_DRAM_BANKS] __attribute__((used));
 int32_t bank_to_l1_offset[NUM_L1_BANKS] __attribute__((used));
+#endif
 
 // c_tensix_core core;
 
@@ -122,7 +124,9 @@ int main() {
     my_logical_x_ = mailboxes->core_info.absolute_logical_x;
     my_logical_y_ = mailboxes->core_info.absolute_logical_y;
 
+#ifndef TT_METAL_LIGHTWEIGHT_KERNEL_ASSERTS
     noc_bank_table_init(MEM_IERISC_BANK_TO_NOC_SCRATCH);
+#endif
 
     risc_init();
 
