@@ -303,6 +303,7 @@ class StableDiffusion3Pipeline:
             parallel_config=self.vae_parallel_config,
             ccl_manager=self.ccl_managers[vae_submesh_idx],
         )
+        self._vae_decoder_tracer = Tracer(self._vae_decoder.forward, device=self.vae_device)
 
         if self.desired_encoder_submesh_shape != self.original_submesh_shape:
             # HACK: reshape submesh device 0 to 1D
@@ -843,7 +844,7 @@ class StableDiffusion3Pipeline:
         else:
             ttnn.copy_host_to_device_tensor(tt_latents, self._vae_input_latents)
 
-        decoded_output = self._vae_decoder(self._vae_input_latents)
+        decoded_output = self._vae_decoder_tracer(self._vae_input_latents)
         return decoded_output
 
     def synchronize_devices(self):
