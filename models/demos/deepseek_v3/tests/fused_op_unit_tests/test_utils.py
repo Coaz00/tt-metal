@@ -330,23 +330,40 @@ def run_device_profiler_local(
     env["TTNN_OP_PROFILER"] = "1"
     env["TT_METAL_PROFILER_TRACE_TRACKING"] = "1"
 
-    device_analysis_opt = "".join(f" -a {analysis}" for analysis in device_analysis_types)
+    normalized_command = command.strip()
+    if (
+        len(normalized_command) >= 2
+        and normalized_command[0] == normalized_command[-1]
+        and normalized_command[0] in {"'", '"'}
+    ):
+        # Guard against accidentally wrapping the full command in a single quote pair.
+        normalized_command = normalized_command[1:-1]
 
     def run_tracy(python_post_process: bool):
         if python_post_process:
-            # Keep shell-style invocation for -r to mirror tools/tracy/process_model_log.py behavior.
-            profiler_cmd = (
-                "python3 -m tracy -p -r -o "
-                + shlex.quote(str(profiler_dir))
-                + " --check-exit-code"
-                + device_analysis_opt
-                + " --op-support-count "
-                + str(op_support_count)
-                + " -t 5000 -m "
-                + shlex.quote(command)
-            )
+            tracy_args = [
+                "python3",
+                "-m",
+                "tracy",
+                "-p",
+                "-r",
+                "-o",
+                str(profiler_dir),
+                "--check-exit-code",
+                "--op-support-count",
+                str(op_support_count),
+                "-t",
+                "5000",
+            ]
+            for analysis in device_analysis_types:
+                tracy_args.extend(["-a", analysis])
+            tracy_args.append("-m")
+            # Tracy expects a single command string after -m; tokenizing here
+            # causes quoted pytest -k expressions to be split and misparsed.
+            tracy_args.append(normalized_command)
+            profiler_cmd = " ".join(shlex.quote(arg) for arg in tracy_args)
             logger.info(f"Running device profiler: {profiler_cmd}")
-            result = subprocess.run([profiler_cmd], shell=True, check=False, capture_output=True, text=True, env=env)
+            result = subprocess.run(tracy_args, check=False, capture_output=True, text=True, env=env)
             return profiler_cmd, result
 
         # For -p fallback, pass argv tokens to avoid treating full command as a module name.
@@ -366,7 +383,8 @@ def run_device_profiler_local(
         for analysis in device_analysis_types:
             tracy_args.extend(["-a", analysis])
         tracy_args.append("-m")
-        tracy_args.extend(shlex.split(command))
+        # Keep command as one string so pytest -k expressions remain intact.
+        tracy_args.append(normalized_command)
 
         profiler_cmd = " ".join(shlex.quote(arg) for arg in tracy_args)
         logger.info(f"Running device profiler: {profiler_cmd}")

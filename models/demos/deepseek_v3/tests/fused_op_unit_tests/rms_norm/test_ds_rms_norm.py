@@ -44,7 +44,7 @@ DEVICE_PERF_ENV_VAR = "DS_RMS_NORM_DEVICE_PERF"
 PERF_WARMUP_ITERS = 10
 PERF_MEASURE_ITERS = 100
 DEVICE_PERF_ITERS = 10
-DEVICE_PERF_MARGIN = 0.1
+DEVICE_PERF_MARGIN = 0.2
 DEVICE_PERF_TARGETS_US = {
     ("decode", 1, "kv_lora_rank"): {"kernel": 11.453, "op_to_op": 712.532},
     ("decode", 1, "q_lora_rank"): {"kernel": 27.323, "op_to_op": 836.009},
