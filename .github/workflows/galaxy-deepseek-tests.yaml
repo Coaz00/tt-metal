@@ -11,15 +11,8 @@ on:
           - all
           - unit
           - module
-<<<<<<< HEAD
-<<<<<<< HEAD
           - long-seq-module
-=======
-          - op
->>>>>>> 6398daafcc (modified ci pipeline)
-=======
           - final-op-unit
->>>>>>> fce57306ff (fix ci perf test)
         default: 'all'
       platform:
         required: false
@@ -45,11 +38,6 @@ on:
         type: boolean
         default: false
         description: "Enable Link Time Optimization (LTO)"
-      enable-tracy:
-        required: false
-        type: boolean
-        default: false
-        description: "Enable Tracy profiling support for device performance tests"
   schedule:
     - cron: "0 3 * * *" # Run at 3:00 AM UTC (11:00 PM EST) every day
 
@@ -64,8 +52,6 @@ jobs:
       build-wheel: true
       platform: ${{ inputs.platform || 'Ubuntu 22.04' }}
       enable-lto: ${{ inputs.enable-lto || false }}
-      # Enable Tracy profiling support for device performance tests
-      tracy: ${{ inputs.enable-tracy || false }}
   Galaxy-DeepSeek-tests:
     needs: build-artifact
     secrets: inherit
@@ -76,4 +62,3 @@ jobs:
       wheel-artifact-name: ${{ needs.build-artifact.outputs.wheel-artifact-name }}
       topology: topology-6u
       test-type: ${{ inputs.test-type || 'all' }}
-      enable-tracy: ${{ inputs.enable-tracy || false }}
