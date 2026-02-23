@@ -100,6 +100,7 @@ class DeepseekGenerator:
         force_recalculate: bool = False,
         mtp_mode: str = "auto",
         min_mtp_accept_rate: float | None = None,
+        mtp_skip_on_accept: bool | None = None,
     ) -> None:
         self.mesh_device = mesh_device
         self.model_path = str(model_path)
@@ -157,6 +158,7 @@ class DeepseekGenerator:
             self.hf_config.num_nextn_predict_layers = 0
         self.mtp_mode = mtp_mode
         self.min_mtp_accept_rate = min_mtp_accept_rate
+        self.mtp_skip_on_accept = mtp_skip_on_accept
         logger.info(f"MTP enabled: {self.enable_mtp}")
         # Tokenizer is optional; caller can pass a tokenizer or handle failure.
         self.tokenizer = tokenizer
@@ -1130,8 +1132,13 @@ class DeepseekGenerator:
                 debug_mtp = bool(int(os.getenv("DEEPSEEK_MTP_DEBUG", "0")))
                 debug_mtp_steps = int(os.getenv("DEEPSEEK_MTP_DEBUG_STEPS", "3"))
                 debug_mtp_step_idx = 0
+                mtp_step_trace = bool(int(os.getenv("DEEPSEEK_MTP_STEP_TRACE", "0")))
                 if use_mtp_path:
-                    skip_accept_decode = True
+                    if self.mtp_skip_on_accept is None:
+                        skip_accept_decode = os.getenv("DEEPSEEK_MTP_DISABLE_SKIP_ACCEPT", "0") != "1"
+                    else:
+                        skip_accept_decode = bool(self.mtp_skip_on_accept)
+                    logger.info(f"MTP skip-on-accept path enabled: {skip_accept_decode}")
                     prompt_mask = torch.arange(num_of_users) < num_of_prompts
                     generated_counts = torch.zeros((num_of_users,), dtype=torch.int32)
                     generated_counts[prompt_mask] = 1
@@ -1160,6 +1167,7 @@ class DeepseekGenerator:
                     total_accepts_alt = 0
                     total_verifies_alt = 0
                     skipped_decode_tokens = 0
+                    accepted_prev_spec_reused_for_next_spec = 0
 
                     while any(generated_counts[i] < max_new_tokens for i in range(num_of_prompts)):
                         # Pack verification batch into available decode lanes:
@@ -1232,8 +1240,38 @@ class DeepseekGenerator:
                             for i in range(num_of_prompts)
                             if accepted_prompt_mask[i] and generated_counts[i] < max_new_tokens
                         ]
+                        if mtp_step_trace:
+                            for i in range(num_of_prompts):
+                                prev_spec_token = int(spec_tokens[i].item())
+                                next_pred_token = int(pred_next[i].item())
+                                verify_lane_pred_token = int(pred_after_spec[i].item())
+                                prev_spec_accepted = next_pred_token == prev_spec_token
+                                next_lane_pos = int(batched_positions[i].item())
+                                verify_lane_pos = int(batched_positions[verify_offset + i].item())
+                                updated_pos = int(positions[i].item())
+                                logger.info(
+                                    "MTP_STEP user={} step={} "
+                                    "next_lane(pred_token={}, pos={}) "
+                                    "spec_lane(input_spec_token={}, verify_pred_token={}, pos={}) "
+                                    "prev_spec_accepted={} updated_pos={} next_verify_pos={}".format(
+                                        i,
+                                        decode_step_idx - 1,
+                                        next_pred_token,
+                                        next_lane_pos,
+                                        prev_spec_token,
+                                        verify_lane_pred_token,
+                                        verify_lane_pos,
+                                        prev_spec_accepted,
+                                        updated_pos,
+                                        updated_pos + 1,
+                                    )
+                                )
                         if skip_accept_decode and accepted_indices:
                             skipped_decode_tokens += len(accepted_indices)
+                            accepted_prev_spec_reused_for_next_spec += len(accepted_indices)
+                            logger.info(
+                                f"MTP skip-path accepted speculative lanes at step {decode_step_idx - 1}: {accepted_indices}"
+                            )
 
                         if debug_mtp and debug_mtp_step_idx < debug_mtp_steps:
                             debug_mtp_step_idx += 1
@@ -1319,6 +1357,10 @@ class DeepseekGenerator:
                         # For MTP: hidden[t] + token[t+1] -> predict token[t+2]
                         tokens_for_spec[:num_of_prompts] = pred_next
                         positions_for_spec[:num_of_prompts] = positions_before[:num_of_prompts] + 1
+                        if skip_accept_decode and accepted_indices:
+                            accepted_idx_tensor = torch.tensor(accepted_indices, dtype=torch.long)
+                            # Explicitly route accepted speculative tokens into the next speculation step.
+                            tokens_for_spec[accepted_idx_tensor] = spec_tokens[accepted_idx_tensor]
                         spec_logits_full = self._mtp_predict_logits(
                             hidden_states=hidden_2b_tt,
                             tokens_step=tokens_for_spec,
@@ -1330,12 +1372,25 @@ class DeepseekGenerator:
 
                         spec_tokens_next = spec_all[:num_of_prompts]
                         spec_tokens = spec_tokens_next
+                        if mtp_step_trace:
+                            for i in range(num_of_prompts):
+                                logger.info(
+                                    "MTP_STEP_NEXT_SPEC user={} step={} next_spec_token={}".format(
+                                        i, decode_step_idx - 1, int(spec_tokens[i].item())
+                                    )
+                                )
 
                     if total_verifies > 0:
                         mtp_accept_rate = total_accepts / total_verifies
                         logger.info(f"MTP accept rate: {total_accepts}/{total_verifies} = {mtp_accept_rate:.3f}")
-                        if skip_accept_decode:
-                            logger.info(f"MTP skipped decode tokens via accepted speculation: {skipped_decode_tokens}")
+                        logger.info(
+                            "MTP skip-path summary: enabled={} skipped_decode_tokens={} "
+                            "accepted_prev_spec_reused_for_next_spec={}".format(
+                                skip_accept_decode,
+                                skipped_decode_tokens if skip_accept_decode else 0,
+                                accepted_prev_spec_reused_for_next_spec if skip_accept_decode else 0,
+                            )
+                        )
                         if self.min_mtp_accept_rate is not None and mtp_accept_rate < self.min_mtp_accept_rate:
                             raise RuntimeError(
                                 f"MTP accept rate {mtp_accept_rate:.3f} below required minimum "

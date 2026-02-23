@@ -134,9 +134,15 @@ def create_parser() -> argparse.ArgumentParser:
         help="If set, require MTP accept rate to be at least this value.",
     )
     p.add_argument(
+        "--mtp-skip-on-accept",
+        choices=["auto", "on", "off"],
+        default="auto",
+        help="Control MTP skip-on-accept behavior: auto (env/default), on (force), off (disable).",
+    )
+    p.add_argument(
         "--compare-output",
         type=str,
-        help="Path to a baseline output JSON to compare against (text-only).",
+        help="Path to a baseline output JSON to compare against (prompt+generated text only).",
     )
     p.add_argument(
         "--repeat-batches",
@@ -273,6 +279,7 @@ def run_demo(
     force_recalculate: bool = False,
     mtp: str = "auto",
     min_mtp_accept_rate: float | None = None,
+    mtp_skip_on_accept: str = "auto",
 ) -> dict:
     """Programmatic entrypoint for the DeepSeek-V3 demo.
 
@@ -356,6 +363,12 @@ def run_demo(
 
             token_acc = TokenAccuracy(str(reference_file), prompt_len=tf_prompt_len)
         if generator == "bp":
+            if mtp_skip_on_accept == "on":
+                mtp_skip_on_accept_override = True
+            elif mtp_skip_on_accept == "off":
+                mtp_skip_on_accept_override = False
+            else:
+                mtp_skip_on_accept_override = None
             gen = DeepseekGeneratorDP(
                 mesh_device=mesh_device,
                 model_path=model_path,
@@ -374,6 +387,7 @@ def run_demo(
                 force_recalculate=force_recalculate,
                 mtp_mode=mtp,
                 min_mtp_accept_rate=min_mtp_accept_rate,
+                mtp_skip_on_accept=mtp_skip_on_accept_override,
             )
         # Build the prompt list
         pre_tokenized_prompts = None
@@ -522,6 +536,7 @@ def main() -> None:
         prefill_max_tokens=args.prefill_max_tokens,
         mtp=args.mtp,
         min_mtp_accept_rate=args.min_mtp_accept_rate,
+        mtp_skip_on_accept=args.mtp_skip_on_accept,
     )
 
     # If prompts were loaded from a JSON file, save output to JSON file instead of printing
@@ -604,18 +619,27 @@ def main() -> None:
                 baseline = json.load(f)
         except Exception as e:
             raise SystemExit(f"Failed to read baseline output '{baseline_path}': {e}")
+        baseline_prompts = baseline.get("prompts", [])
         baseline_generations = baseline.get("generations", [])
         current_generations = results.get("generations", [])
-        if len(baseline_generations) != len(current_generations):
+        current_prompts = args.prompts or []
+        if baseline_prompts and baseline_prompts != current_prompts:
+            raise SystemExit("Output mismatch: baseline and current prompts differ.")
+        if len(baseline_generations) != len(current_generations) or len(current_prompts) != len(current_generations):
             raise SystemExit(
-                f"Baseline generations count {len(baseline_generations)} does not match current {len(current_generations)}"
+                "Baseline/current generation counts do not match prompt count "
+                f"({len(baseline_generations)} baseline vs {len(current_generations)} current vs {len(current_prompts)} prompts)."
             )
         for i, (base_gen, cur_gen) in enumerate(zip(baseline_generations, current_generations)):
+            base_prompt = base_gen.get("prompt")
+            cur_prompt = current_prompts[i]
+            if base_prompt != cur_prompt:
+                raise SystemExit(f"Output mismatch at generation {i}: baseline and current prompts differ.")
             base_text = base_gen.get("text")
             cur_text = cur_gen.get("text")
             if base_text != cur_text:
                 raise SystemExit(f"Output mismatch at generation {i}: baseline and current text differ.")
-        logger.info("Output comparison passed: baseline and current generations match exactly.")
+        logger.info("Output comparison passed: prompt+generated text content matches exactly.")
 
 
 if __name__ == "__main__":

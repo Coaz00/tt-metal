@@ -3,7 +3,15 @@ prompt: |
   1. Verify that the current branch, with MTP disabled, produces the exact same outputs as the reference commit off main f250fa343767e85500afd3db46f3a7f3d31b11ff. The full demo outputs for that run are stored in the log file logs/deepseek_demo_baseline_f250fa_20260216_195652.json.
   2. Verify that the current branch with MTP enabled produces the exact same outputs as MTP disabled using the full demo
   3. Verify that the acceptance rate it >= 75% to make sure that the MTP is actually working and used to produce the outputs.
-  4. Verify that the acceptance of the previous speculated token is used to skip the unnecessary decode step, and the previous speculated token is used to produce the next prediction and speculation.
+  4. Verify that the *acceptance of a previous speculated token is used to skip that decode step*, and the *previous speculated token is used to produce the next prediction and speculation*.
+
+  Additional verification checks (required):
+  5. Reference integrity check: verify that `logs/deepseek_demo_baseline_f250fa_20260216_195652.json` has not changed by comparing sha256 before/after runs.
+  6. Content-only parity check: when comparing output JSONs, compare only prompt and generated text content (ignore runtime/statistics metadata fields that are expected to differ).
+  7. Deterministic run settings: use greedy decode and fixed prompts for both MTP off/on runs so comparisons are meaningful.
+  8. Trace-based skip proof for step 4: in MTP-on trace logs, show explicit evidence that skip path executed (skip count > 0) and that accepted speculated tokens feed the next prediction/speculation step.
+  9. No-hang/completion check: each verification run must complete within timeout, exit cleanly (exit code 0), and print final verification summary lines.
+  10. Skip-path A/B safety check: run once with skip path disabled (env toggle) and confirm output parity still holds; only decode-step behavior/performance should differ.
 
   Read instructions in .agents/skills.
 

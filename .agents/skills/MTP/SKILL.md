@@ -118,6 +118,12 @@ description: Bring up multi-token prediction (speculative decoding) for TTNN tra
   - Removing decode warm-up before trace capture can trigger `TT_FATAL: Writes are not supported during trace capture`.
   - A naive warm-up decode on real page tables can mutate decode cache state and break output parity.
   - An isolated warm-up routed to a non-prompt cache row can stabilize capture/hangs, but parity still needs explicit token-level validation.
+- Distributed env toggles are not always reliable across launcher ranks:
+  - For A/B checks, prefer explicit CLI/runtime wiring over ad-hoc env vars so both ranks use identical settings.
+  - In this repo, `--mtp-skip-on-accept on|off|auto` is the deterministic control point for skip-path verification.
+- Reference parity requires matching run settings exactly:
+  - The stored reference artifact `deepseek_demo_baseline_f250fa_20260216_195652.json` corresponds to the shorter generation configuration (`--max-new-tokens 16`), not 32.
+  - If parity fails with otherwise correct code, verify decode length first before deeper debugging.
 
 ## Verified Run Snapshot (2026-02-18, patch13)
 - Verified artifacts:
