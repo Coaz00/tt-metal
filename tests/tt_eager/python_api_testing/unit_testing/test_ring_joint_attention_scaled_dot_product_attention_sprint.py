@@ -6,7 +6,7 @@
 Ring Joint Attention SDPA Sprint Tests
 
 Tests Ring Joint Attention performance and accuracy across multi-chip architectures.
-Supports Galaxy (4x8 mesh), single ring (1xN), and single device configurations.
+Supports Galaxy (4x8 mesh) and single ring (1xN) configurations.
 """
 import math
 import torch
@@ -23,6 +23,56 @@ from tracy.process_model_log import (
     get_latest_ops_log_filename,
     run_device_profiler,
 )
+
+# ============================================================================
+# CONFIGURATION CONSTANTS
+# ============================================================================
+
+# Hardware-specific constants
+# These are hardcoded to handle firmware differences across versions
+GALAXY_GRID_COLS = 12
+GALAXY_GRID_ROWS = 10
+NON_GALAXY_GRID_COLS = 11
+NON_GALAXY_GRID_ROWS = 10
+
+# Derived hardware constants
+GALAXY_TOTAL_CORES = GALAXY_GRID_COLS * GALAXY_GRID_ROWS  # 110 cores
+NON_GALAXY_TOTAL_CORES = NON_GALAXY_GRID_COLS * NON_GALAXY_GRID_ROWS  # 100 cores
+
+# CCL allocation: last column reserved for CCL operations
+GALAXY_CCL_COLUMN = GALAXY_GRID_COLS - 1  # Column 10
+GALAXY_SDPA_COLS = GALAXY_CCL_COLUMN  # Columns 0-9
+GALAXY_SDPA_CORES = GALAXY_SDPA_COLS * GALAXY_GRID_ROWS  # 100 cores
+
+NON_GALAXY_CCL_COLUMN = NON_GALAXY_GRID_COLS - 1  # Column 9
+NON_GALAXY_SDPA_COLS = NON_GALAXY_CCL_COLUMN  # Columns 0-8
+NON_GALAXY_SDPA_CORES = NON_GALAXY_SDPA_COLS * NON_GALAXY_GRID_ROWS  # 90 cores
+
+# Galaxy mesh configuration constants
+GALAXY_DEVICE_COUNT = 32  # Total devices in Galaxy
+GALAXY_TP_SIZE = 4  # Tensor parallel size (number of rings)
+GALAXY_SP_SIZE = 8  # Sequence parallel size (devices per ring)
+
+# Workload configuration constants
+BASE_SEQ_LENS_PER_DEVICE = [2368, 9472]  # Base sequence lengths designed for Galaxy
+HEADS_PER_DEVICE = 10  # Number of attention heads per device
+HEAD_DIMENSION = 128  # Attention head dimension
+BATCH_SIZE = 1  # Default batch size
+
+# Chunk size sweep parameters
+Q_CHUNK_SIZES = [224, 256, 288]  # Query chunk sizes for tiling
+K_CHUNK_SIZES = [128, 256, 512]  # Key chunk sizes for tiling
+
+# Memory alignment constants
+TILE_ALIGNMENT_BOUNDARY = 32  # TT-Metal tile alignment boundary
+
+# Performance calculation constants
+BLACKHOLE_CLOCK_GHZ = 1.35  # Blackhole clock frequency in GHz
+MM_FLOPS_PER_CYCLE_PER_CORE = 2048  # Matrix multiply FLOPs per cycle per core
+
+# Accuracy threshold constants
+DEFAULT_PCC_THRESHOLD = 0.994  # Pearson correlation coefficient threshold (relaxed for joint attention)
+DEFAULT_RMSE_THRESHOLD = 0.05  # Root mean square error threshold (relaxed for joint attention)
 
 
 def post_process_ops_log(
@@ -90,9 +140,7 @@ def compute_ring_joint_cores_used(seqlen, q_chunk_size, compute_cores, num_heads
     Returns:
         cores_used: Number of compute cores actually used
     """
-    import math
-
-    B = 1
+    B = BATCH_SIZE
     local_seq_len = seqlen // ring_size
     q_num_chunks = math.ceil(local_seq_len / q_chunk_size)
 
@@ -123,8 +171,8 @@ def compute_ring_joint_utilization(local_seqlen, total_seqlen, head_dim, num_hea
     mm_flops = 4 * local_seqlen * total_seqlen * head_dim * num_heads_per_device
 
     # Convert to cycles and compute theoretical FLOPs
-    cycles = duration_ns * 1.35  # 1.35 GHz clock
-    theoretical_flops = core_count * cycles * 2048  # 2048 MM flops per cycle per core
+    cycles = duration_ns * BLACKHOLE_CLOCK_GHZ  # Blackhole clock frequency
+    theoretical_flops = core_count * cycles * MM_FLOPS_PER_CYCLE_PER_CORE
     utilization = (mm_flops / theoretical_flops) * 100
     return utilization
 
@@ -159,18 +207,6 @@ def torch_joint_sdpa_reference(q, k, v, joint_q, joint_k, joint_v, num_devices):
     return main_out, joint_out
 
 
-def detect_available_devices():
-    """
-    Detect the number of available TT devices and return device count.
-    """
-    try:
-        num_devices = ttnn.get_num_devices()
-        return num_devices
-    except Exception as e:
-        logger.error(f"Failed to detect devices: {e}")
-        return 0
-
-
 def detect_devices_without_opening():
     """
     Detect the number of available TT devices WITHOUT opening them.
@@ -179,40 +215,29 @@ def detect_devices_without_opening():
     """
     import glob
 
-    try:
-        # Count /dev/tenstorrent/* device files (e.g., /dev/tenstorrent/0, /dev/tenstorrent/1, etc.)
-        device_files = glob.glob("/dev/tenstorrent/*")
-        device_count = len(device_files)
-        if device_count > 0:
-            return device_count
-        else:
-            return 4  # bh qb
-    except Exception as e:
-        logger.error(f"Failed to detect devices: {e}")
-        return 4  # bh qb
+    # Count /dev/tenstorrent/* device files (e.g., /dev/tenstorrent/0, /dev/tenstorrent/1, etc.)
+    device_files = glob.glob("/dev/tenstorrent/*")
+    return len(device_files)
 
 
 def calculate_mesh_config(num_devices):
     """
     Calculate mesh configuration based on available devices.
+    Assumes either Galaxy or multi-chip device setup.
 
     Returns:
         sp_size: Sequence parallel size (devices per ring)
         tp_size: Tensor parallel size (number of rings)
         arch_type: Architecture type string
     """
-    if num_devices == 32:  # Galaxy case: 4x8 mesh = 4 rings of 8 devices each
-        sp_size = 8  # devices per ring
-        tp_size = 4  # number of rings (TP dimension)
+    if num_devices == GALAXY_DEVICE_COUNT:  # Galaxy case: 4x8 mesh = 4 rings of 8 devices each
+        sp_size = GALAXY_SP_SIZE  # devices per ring
+        tp_size = GALAXY_TP_SIZE  # number of rings (TP dimension)
         arch_type = "galaxy_4x8"  # wan2.2 compatible
-    elif num_devices >= 2:  # Single ring case
+    else:  # Multi-chip single ring case
         sp_size = num_devices  # all devices in one ring
         tp_size = 1  # single ring
         arch_type = f"single_ring_{num_devices}x1"
-    else:  # Single device fallback
-        sp_size = 1
-        tp_size = 1
-        arch_type = "single_device"
 
     return sp_size, tp_size, arch_type
 
@@ -222,9 +247,11 @@ def generate_input_shapes():
     Generate input shapes based on available devices.
 
     Per-device targets:
-    - Sequence length per device: 9472 or 2368
+    - Sequence length per device: 9472 or 2368 (Galaxy) or adjusted for non-Galaxy
     - Heads per device: 10 (computation per device)
     - Total heads = 10 × tp_size (devices across TP share same heads)
+
+    For non-Galaxy: sequence length is scaled by *10/11 and TILE aligned
 
     NOTE: Uses detect_devices_without_opening() to avoid holding device locks
     during pytest collection, which would block subprocess profiling.
@@ -232,9 +259,25 @@ def generate_input_shapes():
     num_devices = detect_devices_without_opening()
     sp_size, tp_size, arch_type = calculate_mesh_config(num_devices)
 
-    # Calculate total shapes based on per-device requirements
-    seq_lens_per_device = [9472, 2368]
-    heads_per_device = 10
+    # Base sequence lengths per device
+    base_seq_lens_per_device = BASE_SEQ_LENS_PER_DEVICE
+    heads_per_device = HEADS_PER_DEVICE
+
+    # Adjust sequence lengths based on architecture
+    seq_lens_per_device = []
+    for base_seq_len in base_seq_lens_per_device:
+        if arch_type.startswith("galaxy"):
+            # Galaxy uses original sequence lengths (11x10 grid)
+            seq_len_per_device = base_seq_len
+        else:
+            # Non-Galaxy: scale by total columns ratio (10 vs 11 columns total compute capacity)
+            # Base sequence lengths are designed for Galaxy's 11-column capacity
+            scaled_seq_len = int(base_seq_len * (NON_GALAXY_GRID_COLS - 1) / (GALAXY_GRID_COLS - 1))  # 10/11
+            # Ensure TILE alignment (32-boundary for TT-Metal tiles)
+            seq_len_per_device = (
+                (scaled_seq_len + TILE_ALIGNMENT_BOUNDARY - 1) // TILE_ALIGNMENT_BOUNDARY
+            ) * TILE_ALIGNMENT_BOUNDARY
+        seq_lens_per_device.append(seq_len_per_device)
 
     shapes = []
     shape_ids = []
@@ -245,7 +288,7 @@ def generate_input_shapes():
         # Total heads = heads_per_device * tp_size (TP devices share same heads)
         total_heads = heads_per_device * tp_size
 
-        shape = [1, total_heads, total_seq_len, 128]
+        shape = [BATCH_SIZE, total_heads, total_seq_len, HEAD_DIMENSION]
         shapes.append(shape)
         shape_ids.append(f"wan2_2_compat_{seq_len_per_device}x{sp_size}_h{total_heads}")
 
@@ -267,7 +310,7 @@ def run_ring_joint_sdpa(
     k_chunk_size,
     dtype,
     sk=None,
-    pcc_threshold=0.994,  # Relaxed for joint attention complexity
+    pcc_threshold=DEFAULT_PCC_THRESHOLD,  # Relaxed for joint attention complexity
     rmse_threshold=None,
     do_check=True,
 ):
@@ -279,9 +322,9 @@ def run_ring_joint_sdpa(
         nh: Number of attention heads
         nkv: Number of key/value heads (must equal nh for joint attention)
         sq: Base sequence length (will be distributed across ring)
-        d: Head dimension (64 or 128 typically)
-        q_chunk_size: Query chunk size for tiling (64, 128, 256, 512)
-        k_chunk_size: Key chunk size for tiling (128, 256, 512)
+        d: Head dimension (see HEAD_DIMENSION)
+        q_chunk_size: Query chunk size for tiling (see Q_CHUNK_SIZES)
+        k_chunk_size: Key chunk size for tiling (see K_CHUNK_SIZES)
         dtype: Data type (ttnn.bfloat16)
         sk: Key sequence length (defaults to sq if None)
         pcc_threshold: Pearson correlation threshold for accuracy
@@ -304,7 +347,7 @@ def run_ring_joint_sdpa(
         pytest.skip(f"Ring joint attention currently requires nh == nkv, got nh={nh}, nkv={nkv}")
 
     # Auto-detect mesh configuration based on available devices
-    num_devices = detect_available_devices()
+    num_devices = detect_devices_without_opening()
     sp_size, tp_size, arch_type = calculate_mesh_config(num_devices)
     ring_size = sp_size  # Ring size is the SP dimension
 
@@ -318,45 +361,18 @@ def run_ring_joint_sdpa(
         ttnn.FabricManagerMode.DEFAULT,
     )
 
-    # Mesh axis configuration based on architecture
-    if arch_type.startswith("galaxy"):
-        # Galaxy: 4x8 mesh (SP=8, TP=4) - wan2.2 compatible
-        sp_axis = 1  # Column axis for sequence parallel (ring axis)
-        tp_axis = 0  # Row axis for tensor parallel (head axis)
-    else:
-        # Single ring: maintain original working configuration for compatibility
-        # Original working pattern: rp_axis = 1, up_axis = 0 for 1xN mesh
-        sp_axis = 1  # Ring axis (column axis for 1xN mesh)
-        tp_axis = 0  # Up axis (row axis for 1xN mesh)
+    # Mesh axis configuration
+    sp_axis = 1  # Column axis for sequence parallel (ring axis)
+    tp_axis = 0  # Row axis for tensor parallel (head axis)
 
     # Each SP device processes sq // sp_size local tokens + joint tokens
     local_seq_len = sq // sp_size  # Sequence length per SP device
     joint_seq_len = 0  # Use empty joint sequence like wan2.2 (dummy joint tensors)
 
     # Open mesh device based on calculated configuration
-    try:
-        if arch_type == "single_device":
-            # Single device case
-            mesh_device = ttnn.open_device(device_id=0)
-        else:
-            # Multi-device mesh case
-            if arch_type.startswith("galaxy"):
-                mesh_shape = ttnn.MeshShape(tp_size, sp_size)  # 4x8 mesh for Galaxy (wan2.2 compatible)
-            elif arch_type.startswith("single_ring"):
-                mesh_shape = ttnn.MeshShape(1, sp_size)  # 1xN mesh for single ring
-
-            mesh_device = ttnn.open_mesh_device(mesh_shape=mesh_shape)
-
-            # Always use num_links = 2 (fixed configuration)
-            num_links = 2
-
-    except Exception as e:
-        mesh_device = ttnn.open_device(device_id=0)
-        sp_size = 1  # Override size due to hardware constraints
-        tp_size = 1
-        ring_size = 1
-        arch_type = "single_device_fallback"
-        num_links = 2  # Fixed to 2 even for single device fallback
+    mesh_shape = ttnn.MeshShape(tp_size, sp_size)  # Galaxy: 4x8, Single ring: 1xN
+    mesh_device = ttnn.open_mesh_device(mesh_shape=mesh_shape)
+    num_links = 2  # Fixed configuration
 
     try:
         # Validate constraints for ring joint attention
@@ -366,15 +382,19 @@ def run_ring_joint_sdpa(
         if tp_size > 1 and nh % tp_size != 0:
             pytest.skip(f"num_heads ({nh}) must be divisible by TP size ({tp_size}) for multi-ring architecture")
 
-        # Configure compute grid and CCL coordination - USING COLUMN-BASED CCL (avoid dispatch cores)
-        # On Blackhole, dispatch cores use columns, so we need to avoid the actual dispatch column
-        full_compute_grid = mesh_device.compute_with_storage_grid_size()
-
-        # Use the last column for CCL (more efficient: SDPA gets more cores, CCL gets full column)
-        ccl_column = full_compute_grid.x - 1  # Use last column for CCL operations
-        sdpa_compute_grid = (ccl_column, full_compute_grid.y)  # SDPA gets columns 0 to (ccl_column-1)
+        # Configure compute grid and CCL coordination - USING HARDCODED GRIDS
+        # Use hardcoded grid sizes to handle firmware differences across versions
+        if arch_type.startswith("galaxy"):
+            sdpa_compute_grid = (GALAXY_SDPA_COLS, GALAXY_GRID_ROWS)  # 10x10 for SDPA
+            ccl_column = GALAXY_CCL_COLUMN  # Column 10 for CCL
+        else:
+            sdpa_compute_grid = (NON_GALAXY_SDPA_COLS, NON_GALAXY_GRID_ROWS)  # 9x10 for SDPA
+            ccl_column = NON_GALAXY_CCL_COLUMN  # Column 9 for CCL
 
         ccl_core_grid_offset = ttnn.CoreCoord(ccl_column, 0)  # Point to CCL column
+
+        # Get actual device grid for sub-device creation (still need this for validation)
+        full_compute_grid = mesh_device.compute_with_storage_grid_size()
 
         # Create sub-device for CCL operations - Must include ALL cores that operations will use
         # SDPA uses compute grid (0,0) to (ccl_column-1, full_compute_grid.y-1)
@@ -617,14 +637,8 @@ def run_ring_joint_sdpa(
             assert out_pass_joint, f"Joint PCC {out_pcc_joint} below threshold {pcc_threshold}"
 
     finally:
-        # Clean up device based on what was opened
-        try:
-            if arch_type == "single_device" or arch_type == "single_device_fallback":
-                ttnn.close_device(mesh_device)
-            else:
-                ttnn.close_mesh_device(mesh_device)
-        except Exception as e:
-            pass
+        # Clean up mesh device
+        ttnn.close_mesh_device(mesh_device)
 
         # Restore fabric to disabled state
         ttnn.set_fabric_config(
@@ -635,14 +649,8 @@ def run_ring_joint_sdpa(
         )
 
 
-# Dynamic input shapes based on available devices
-# Maintains consistent per-device workload: 9472/2368 seq_len per device, 10 heads per device
-
-# Generate shapes dynamically based on detected hardware
+# Generate input shapes dynamically based on detected hardware
 INPUT_SHAPES, INPUT_IDS = generate_input_shapes()
-
-Q_CHUNK_SIZES = [224, 256, 288]
-K_CHUNK_SIZES = [128, 256, 512]
 
 
 # === TEST 1: PERFORMANCE SWEEP ===
@@ -702,8 +710,8 @@ def test_ring_joint_attention_sdpa_accuracy(b, nh, s, d, q_chunk_size, k_chunk_s
     - Joint attention involves more complex CCL coordination and computation paths
     """
     # Use standard attention head configuration (nkv = nh)
-    pcc_threshold = 0.994  # Relaxed for joint attention
-    rmse_threshold = 0.05  # Relaxed for joint attention complexity
+    pcc_threshold = DEFAULT_PCC_THRESHOLD  # Relaxed for joint attention
+    rmse_threshold = DEFAULT_RMSE_THRESHOLD  # Relaxed for joint attention complexity
     run_ring_joint_sdpa(
         b,
         nh,
@@ -715,45 +723,10 @@ def test_ring_joint_attention_sdpa_accuracy(b, nh, s, d, q_chunk_size, k_chunk_s
         dtype,
         pcc_threshold=pcc_threshold,
         rmse_threshold=rmse_threshold,
-        # do_check=False,  # Disable comparison temporarily - core functionality works!
     )
 
 
-# === TEST 3: DETERMINISM TEST ===
-@pytest.mark.parametrize("dtype", [ttnn.bfloat16], ids=["bf16"])
-@pytest.mark.parametrize(
-    "q_chunk_size", Q_CHUNK_SIZES[:1], ids=[f"q{s}" for s in Q_CHUNK_SIZES[:1]]
-)  # Reduce for performance
-@pytest.mark.parametrize(
-    "k_chunk_size", K_CHUNK_SIZES[:1], ids=[f"k{s}" for s in K_CHUNK_SIZES[:1]]
-)  # Reduce for performance
-@pytest.mark.parametrize(
-    "b, nh, s, d",
-    INPUT_SHAPES[:1],  # Test on one shape for performance
-    ids=INPUT_IDS[:1],
-)
-def test_ring_joint_attention_sdpa_determinism(b, nh, s, d, q_chunk_size, k_chunk_size, dtype):
-    """
-    Test Ring Joint Attention SDPA determinism.
-
-    PURPOSE:
-    - Verify that ring joint attention produces identical outputs across multiple runs
-    - Ensure no non-deterministic behavior in distributed joint computation
-    - Validate reproducibility for debugging and testing
-
-    DETERMINISM IN RING JOINT ATTENTION:
-    Ring attention determinism with dummy joint tensors (wan2.2 style) involves:
-    1. Multi-device mesh coordination
-    2. CCL operations with persistent buffers
-    3. Empty joint tensor handling (no actual joint computation)
-
-    This test runs multiple iterations and verifies output consistency.
-    """
-    # Run single iteration test
-    run_ring_joint_sdpa(b, nh, nh, s, d, q_chunk_size, k_chunk_size, dtype, do_check=False)
-
-
-# === TEST 4: PERFORMANCE TABLE GENERATOR ===
+# === TEST 3: PERFORMANCE TABLE GENERATOR ===
 @pytest.mark.timeout(1000)
 @pytest.mark.parametrize(
     "b, nh, s, d",
@@ -771,10 +744,11 @@ def test_ring_joint_attention_create_perf_table(b, nh, s, d):
     - Ring size adaptation: performance scales with number of devices
     - Joint tensors: dummy/empty tensors add minimal overhead (wan2.2 compatible)
 
-    CORE ALLOCATION STRATEGY (Example: 11x10 = 110 total cores):
-    - Last column (column 10): Reserved for CCL operations (10 cores)
-    - Compute columns (0-9): Available for SDPA computation (100 cores)
-    - Total usable compute cores: 100 (vs 110 for regular SDPA)
+    CORE ALLOCATION STRATEGY:
+    - Galaxy (11x10 = 110 total cores): CCL column 10, SDPA columns 0-9 (100 cores)
+    - Non-Galaxy (10x10 = 100 total cores): CCL column 9, SDPA columns 0-8 (90 cores)
+    - CCL uses one full column for ring coordination
+    - SDPA gets remaining columns for attention computation
 
     PERFORMANCE METRICS:
     - Duration: Kernel execution time including CCL coordination
@@ -791,23 +765,23 @@ def test_ring_joint_attention_create_perf_table(b, nh, s, d):
     if ring_size < 2:
         pytest.skip(f"Ring joint attention requires at least 2 devices, got {ring_size}")
 
-    # Estimate compute grid (cannot query device due to TLB conflicts with subprocess tests)
-    # Hardcoded for Blackhole: 11x10 grid with CCL in last column
+    # Use hardcoded grid constants (cannot query device due to TLB conflicts with subprocess tests)
     if arch_type.startswith("galaxy"):
-        # Galaxy: 4x8 mesh, but each ring is still 1x8 for CCL purposes
-        full_grid_cols = 11  # Per-device grid
-        full_grid_rows = 10
+        full_grid_cols = GALAXY_GRID_COLS
+        full_grid_rows = GALAXY_GRID_ROWS
+        ccl_column = GALAXY_CCL_COLUMN
+        compute_cols = GALAXY_SDPA_COLS
+        total_compute_cores = GALAXY_SDPA_CORES
+        total_cores = GALAXY_TOTAL_CORES
     else:
-        # Single ring: assume Blackhole grid
-        full_grid_cols = 11
-        full_grid_rows = 10
+        full_grid_cols = NON_GALAXY_GRID_COLS
+        full_grid_rows = NON_GALAXY_GRID_ROWS
+        ccl_column = NON_GALAXY_CCL_COLUMN
+        compute_cols = NON_GALAXY_SDPA_COLS
+        total_compute_cores = NON_GALAXY_SDPA_CORES
+        total_cores = NON_GALAXY_TOTAL_CORES
 
-    # CCL core allocation: last column reserved for CCL
-    ccl_column = full_grid_cols - 1  # Column 10 for CCL
-    compute_cols = ccl_column  # Columns 0-9 for compute
-    total_compute_cores = compute_cols * full_grid_rows  # 10 * 10 = 100 cores
     ccl_cores = full_grid_rows  # Full column height for CCL
-    total_cores = full_grid_cols * full_grid_rows  # 110 total cores
 
     subdir = "ttnn_ring_joint_sdpa_performance"
     perf_results = []
@@ -844,7 +818,7 @@ def test_ring_joint_attention_create_perf_table(b, nh, s, d):
             # Compute parallelization factors for ring joint attention
             local_seq_len = s // ring_size  # Local sequence per device
 
-            B = 1  # batch size
+            B = BATCH_SIZE
             batch_parallel = min(B, total_compute_cores)
             nh_parallel = min(total_compute_cores // batch_parallel, nh)
             max_q_parallel = total_compute_cores // (batch_parallel * nh_parallel)
