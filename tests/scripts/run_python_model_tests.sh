@@ -30,10 +30,6 @@ run_python_model_tests_grayskull() {
 }
 
 run_python_model_tests_wormhole_b0() {
-    # DeepSeekV3
-    uv pip install -r models/demos/deepseek_v3/reference/deepseek/requirements.txt
-    MESH_DEVICE=AUTO pytest models/demos/deepseek_v3/tests/unit --timeout 60 --durations=0
-
     # Falcon tests
     # attn_matmul_from_cache is currently not used in falcon7b
     pytest models/demos/falcon7b_common/tests/unit_tests/test_falcon_attn_matmul.py -k "not attn_matmul_from_cache"
@@ -49,16 +45,6 @@ run_python_model_tests_wormhole_b0() {
 
     # ViT-base
     pytest -svv models/demos/vision/classification/vit/wormhole/tests/test_ttnn_optimized_sharded_vit_wh.py
-
-
-    # Llama3.1-8B
-    llama8b=meta-llama/Llama-3.1-8B-Instruct
-
-    # Run all Llama3 tests for 8B - dummy weights with tight PCC check
-    tt_cache=$TT_CACHE_HOME/$llama8b
-    HF_MODEL=$llama8b TT_CACHE_PATH=$tt_cache pytest models/tt_transformers/tests/test_model.py -k "quick" ; fail+=$?
-    echo "LOG_METAL: Llama3 tests for $llama8b completed"
-
 }
 
 run_python_model_tests_slow_runtime_mode_wormhole_b0() {

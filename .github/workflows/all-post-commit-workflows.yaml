@@ -109,7 +109,7 @@ on:
         description: "Run TTNN unit tests"
       run-models-unit-tests:
         required: false
-        default: false
+        default: true
         type: boolean
         description: "Run model unit tests"
       run-tt-train-cpp-unit-tests:
