@@ -108,6 +108,8 @@
   skus:
     wh_galaxy:
       timeout: 45
+    bh_galaxy:
+      timeout: 45
   owner_id: U08TJ70UFRT # Harry Andrews
   team: models
 
