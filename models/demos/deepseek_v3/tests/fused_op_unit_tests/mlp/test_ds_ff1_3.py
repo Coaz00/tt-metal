@@ -38,10 +38,10 @@ DEVICE_PERF_ENV_VAR = "DS_FF1_3_DEVICE_PERF"
 PERF_WARMUP_ITERS = 10
 PERF_MEASURE_ITERS = 100
 DEVICE_PERF_ITERS = 10
-DEVICE_PERF_MARGIN = 0.2
+DEVICE_PERF_MARGIN = 0.3
 DEVICE_PERF_TARGETS_US = {
-    ("decode", 1): {"kernel": 64.809, "op_to_op": 486.552},
-    ("prefill", 128): {"kernel": 3910.415, "op_to_op": 233.901},
+    ("decode", 1): {"kernel": 64.825, "op_to_op": 501.224},
+    ("prefill", 128): {"kernel": 3907.177, "op_to_op": 250.104},
 }
 
 

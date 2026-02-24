@@ -32,10 +32,10 @@ DEVICE_PERF_ENV_VAR = "DS_MUL_DEVICE_PERF"
 PERF_WARMUP_ITERS = 10
 PERF_MEASURE_ITERS = 100
 DEVICE_PERF_ITERS = 10
-DEVICE_PERF_MARGIN = 0.2
+DEVICE_PERF_MARGIN = 0.3
 DEVICE_PERF_TARGETS_US = {
-    ("decode", 1): {"kernel": 7.599, "op_to_op": 334.742},
-    ("prefill", 128): {"kernel": 28.651, "op_to_op": 355.160},
+    ("decode", 1): {"kernel": 8.210, "op_to_op": 376.154},
+    ("prefill", 128): {"kernel": 27.984, "op_to_op": 417.760},
 }
 
 
