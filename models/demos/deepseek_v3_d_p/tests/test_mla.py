@@ -72,10 +72,11 @@ def random_weights():
     return weights
 
 
+# sp x tp
 @pytest.mark.parametrize(
     "mesh_device",
-    [(2, 4)],
-    ids=["2x4"],
+    [(4, 2)],
+    ids=["4x2"],
     indirect=True,
 )
 @pytest.mark.parametrize("use_pretrained", [False, True], ids=["random", "pretrained"])

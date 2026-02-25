@@ -45,29 +45,66 @@ class MLASimple:
         - kv_b_proj.weight
         - o_proj.weight
         """
-        # Query projection weights
-        self.q_a_proj_weight = self._to_tt_tensor(state_dict["q_a_proj.weight"])
-        self.q_a_layernorm_weight = self._to_tt_tensor(state_dict["q_a_layernorm.weight"])
-        self.q_b_proj_weight = self._to_tt_tensor(state_dict["q_b_proj.weight"])
+
+        q_a_proj = state_dict["q_a_proj.weight"]
+        q_a_proj = q_a_proj.transpose(-2, -1)
+        tp_shard_dim = 0
+        mesh_mapper = ttnn.ShardTensor2dMesh(
+            self.mesh_device, mesh_shape=tuple(self.mesh_device.shape), dims=(None, tp_shard_dim)
+        )
+        self.q_a_proj_weight = self._to_tt_tensor(q_a_proj, ttnn.bfloat8_b, ttnn.TILE_LAYOUT, mesh_mapper)
+        print(f"q_a_proj_weight per device shape: {self.q_a_proj_weight.shape}")
+
+        self.q_a_layernorm_weight = self._to_tt_tensor(
+            state_dict["q_a_layernorm.weight"],
+            ttnn.bfloat16,
+            ttnn.TILE_LAYOUT,
+            ttnn.ReplicateTensorToMesh(self.mesh_device),
+        )  # check this
+        self.kv_a_layernorm_weight = self._to_tt_tensor(
+            state_dict["kv_a_layernorm.weight"],
+            ttnn.bfloat16,
+            ttnn.TILE_LAYOUT,
+            ttnn.ReplicateTensorToMesh(self.mesh_device),
+        )  # check this
+        self.q_b_proj_weight = self._to_tt_tensor(
+            state_dict["q_b_proj.weight"],
+            ttnn.bfloat8_b,
+            ttnn.TILE_LAYOUT,
+            ttnn.ReplicateTensorToMesh(self.mesh_device),
+        )
 
         # KV projection weights
-        self.kv_a_proj_with_mqa_weight = self._to_tt_tensor(state_dict["kv_a_proj_with_mqa.weight"])
-        self.kv_a_layernorm_weight = self._to_tt_tensor(state_dict["kv_a_layernorm.weight"])
-        self.kv_b_proj_weight = self._to_tt_tensor(state_dict["kv_b_proj.weight"])
+        self.kv_a_proj_with_mqa_weight = self._to_tt_tensor(
+            state_dict["kv_a_proj_with_mqa.weight"],
+            ttnn.bfloat8_b,
+            ttnn.TILE_LAYOUT,
+            ttnn.ReplicateTensorToMesh(self.mesh_device),
+        )
+        self.kv_b_proj_weight = self._to_tt_tensor(
+            state_dict["kv_b_proj.weight"],
+            ttnn.bfloat8_b,
+            ttnn.TILE_LAYOUT,
+            ttnn.ReplicateTensorToMesh(self.mesh_device),
+        )
 
         # Output projection weight
-        self.o_proj_weight = self._to_tt_tensor(state_dict["o_proj.weight"])
+        self.o_proj_weight = self._to_tt_tensor(
+            state_dict["o_proj.weight"], ttnn.bfloat8_b, ttnn.TILE_LAYOUT, ttnn.ReplicateTensorToMesh(self.mesh_device)
+        )
 
         print(f"✓ Loaded {len(state_dict)} weights to TT device")
 
-    def _to_tt_tensor(self, tensor: torch.Tensor) -> ttnn.Tensor:
+    def _to_tt_tensor(
+        self, tensor: torch.Tensor, dtype: ttnn.DataType, layout: ttnn.Layout, mesh_mapper: ttnn.TensorToMesh
+    ) -> ttnn.Tensor:
         return ttnn.from_torch(
             tensor,
             device=self.mesh_device,
-            dtype=ttnn.bfloat16,
-            layout=ttnn.TILE_LAYOUT,
+            dtype=dtype,
+            layout=layout,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
-            mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh_device),
+            mesh_mapper=mesh_mapper,
         )
 
     def get_weight_shapes(self) -> dict[str, tuple]:
