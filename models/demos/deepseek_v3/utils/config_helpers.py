@@ -805,7 +805,7 @@ def shard_and_save(
             raise ValueError(f"Invalid path structure after 'mesh_': {path}")
         path = Path(parts[1])
 
-    return SavedWeight(path, memory_config)
+    return SavedWeight(path, memory_config, ttnn_tensor.dtype)
 
 
 def _shard_device_impl(

@@ -55,8 +55,17 @@ class WeightConfigEncoder(json.JSONEncoder):
             obj = {
                 "path": str(obj.path),
                 "memory_config": None if obj.memory_config is None else json.loads(obj.memory_config.to_json()),
+                "dtype": obj.dtype.name if obj.dtype is not None else None,
             }
         return obj
+
+
+def _decode_ttnn_dtype(dtype_str: str) -> ttnn.DataType:
+    """Decode a ttnn.DataType from its .name string (e.g. 'BFloat16' -> ttnn.bfloat16)."""
+    try:
+        return getattr(ttnn.DataType, dtype_str)
+    except AttributeError:
+        raise ValueError(f"Unknown ttnn.DataType name: {dtype_str!r}")
 
 
 def try_decode_saved_weight(obj: dict[str, Any]) -> Any:
@@ -70,7 +79,13 @@ def try_decode_saved_weight(obj: dict[str, Any]) -> Any:
         "created_with_nd_shard_spec",
     }.issubset(memory_config_dict.keys()):
         return obj
-    return SavedWeight(path=Path(path_str), memory_config=ttnn.MemoryConfig.from_json(json.dumps(memory_config_dict)))
+    dtype_str = obj.get("dtype", None)
+    dtype = _decode_ttnn_dtype(dtype_str) if dtype_str is not None else None
+    return SavedWeight(
+        path=Path(path_str),
+        memory_config=ttnn.MemoryConfig.from_json(json.dumps(memory_config_dict)),
+        dtype=dtype,
+    )
 
 
 def _try_load_cached_config(config_path: Path, weight_cache_path: Path, force_recalculate: bool) -> WeightConfig | None:

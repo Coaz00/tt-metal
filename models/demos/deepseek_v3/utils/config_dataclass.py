@@ -42,6 +42,7 @@ class MeshDeviceStub:
 class SavedWeight:  # TODO: bring regular tensor saving back once Issue #26763 is resolved
     path: Path
     memory_config: ttnn.MemoryConfig | None = None
+    dtype: ttnn.DataType | None = None
 
 
 ConfigDevice = ttnn.MeshDevice | MeshDeviceStub
