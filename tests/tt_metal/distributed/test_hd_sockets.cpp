@@ -638,7 +638,7 @@ TEST_F(HDSocketFixture, D2HSocketMultiChipMaxThroughputBenchmark) {
         GTEST_SKIP() << "Mapping host memory to NOC is not supported on this system";
     }
 
-    constexpr std::size_t kBenchPageSize = 65536;                  // 64KB – max throughput
+    constexpr std::size_t kBenchPageSize = 65536;               // 64KB – max throughput
     constexpr std::size_t kBenchTotalData = 1024UL * 1024 * 1024;  // 1GB
     const std::vector<std::size_t> kBenchFifoSizes = {
         1UL * 1024 * 1024,    //   1MB
@@ -673,9 +673,10 @@ TEST_F(HDSocketFixture, D2HSocketMultiChipMaxThroughputBenchmark) {
                 benchmark_d2h_socket(mesh_device_, fifo_size, kBenchPageSize, data_size, num_iterations, sender_core);
 
             const double throughput_gbps = static_cast<double>(kBenchPageSize) / (us * 1e3);
-            std::cout << chip.tray_id << "," << chip.asic_location << "," << chip.coord << "," << fifo_size << ","
-                      << kBenchTotalData << "," << data_size << "," << pages_per_iter << "," << num_iterations << ","
-                      << total_pages << "," << us << "," << cycles << "," << throughput_gbps << std::endl;
+            std::cout << chip.tray_id << "," << chip.asic_location << "," << chip.coord << ","
+                      << fifo_size << "," << kBenchTotalData << "," << data_size << ","
+                      << pages_per_iter << "," << num_iterations << "," << total_pages << ","
+                      << us << "," << cycles << "," << throughput_gbps << std::endl;
             std::cout.flush();
         }
     }
