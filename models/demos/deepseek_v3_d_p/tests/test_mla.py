@@ -12,7 +12,7 @@ from loguru import logger
 
 from models.demos.deepseek_v3.reference.configuration_deepseek import DeepseekV3Config
 from models.demos.deepseek_v3_d_p.reference.mla_reference import create_mla_reference
-from models.demos.deepseek_v3_d_p.tt.mla import create_mla_simple
+from models.demos.deepseek_v3_d_p.tt.mla import MLASimple
 
 
 @pytest.fixture
@@ -79,7 +79,7 @@ def random_weights():
     indirect=True,
 )
 @pytest.mark.parametrize("use_pretrained", [False, True], ids=["random", "pretrained"])
-def test_reference_and_tt_comparison(use_pretrained, random_weights, pretrained_weights, mesh_device):
+def test_mla(use_pretrained, random_weights, pretrained_weights, mesh_device):
     """
     Test comparing reference and TT MLA modules with same weights.
 
@@ -87,7 +87,6 @@ def test_reference_and_tt_comparison(use_pretrained, random_weights, pretrained_
         use_pretrained: Whether to use pretrained weights
         random_weights: Random weights for testing
         pretrained_weights: Pretrained weights (or skipped if not available)
-        device: TT device
     """
     weight_type = "Pretrained" if use_pretrained else "Random"
     logger.info("=" * 80)
@@ -140,12 +139,7 @@ def test_reference_and_tt_comparison(use_pretrained, random_weights, pretrained_
 
     # Create TT MLA
     logger.info("Creating TT MLA...")
-    mla_tt = create_mla_simple(
-        config=config,
-        state_dict=weights,
-        mesh_device=mesh_device,
-        layer_idx=0,
-    )
+    mla_tt = MLASimple(config, weights, mesh_device, layer_idx=0)
 
     # Verify both exist
     assert mla_ref is not None, "Reference MLA should exist"

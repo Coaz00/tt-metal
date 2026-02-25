@@ -80,12 +80,3 @@ class MLASimple:
             "kv_b_proj.weight": tuple(self.kv_b_proj_weight.shape),
             "o_proj.weight": tuple(self.o_proj_weight.shape),
         }
-
-
-def create_mla_simple(
-    config: PretrainedConfig,
-    state_dict: dict[str, torch.Tensor],
-    mesh_device: ttnn.MeshDevice,
-    layer_idx: int = 0,
-) -> MLASimple:
-    return MLASimple(config, state_dict, mesh_device, layer_idx)
