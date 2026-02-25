@@ -1,11 +1,6 @@
 # SPDX-FileCopyrightText: © 2025 Tenstorrent AI ULC.
 # SPDX-License-Identifier: Apache-2.0
 
-"""
-Simple single-device TT MLA module for DeepSeek V3.
-This module loads weights and converts them to TT tensors without complex configurations.
-"""
-
 import torch
 from transformers.configuration_utils import PretrainedConfig
 
@@ -13,31 +8,15 @@ import ttnn
 
 
 class MLASimple:
-    """
-    Simple Multi-Latent Attention module for single device.
-
-    This module:
-    - Loads weights from a state dict
-    - Converts them to TT tensors using ttnn.from_torch()
-    - Runs on a single device (no mesh)
-    - No caching or complex configurations
-
-    Args:
-        config: DeepSeek V3 configuration
-        state_dict: Dictionary of weights (dequantized, in bfloat16)
-        device: TT device to load weights onto
-        layer_idx: Layer index (default: 0)
-    """
-
     def __init__(
         self,
         config: PretrainedConfig,
         state_dict: dict[str, torch.Tensor],
-        device: ttnn.Device,
+        mesh_device: ttnn.MeshDevice,
         layer_idx: int = 0,
     ):
         self.config = config
-        self.device = device
+        self.mesh_device = mesh_device
         self.layer_idx = layer_idx
 
         # Extract dimensions from config
@@ -82,31 +61,16 @@ class MLASimple:
         print(f"✓ Loaded {len(state_dict)} weights to TT device")
 
     def _to_tt_tensor(self, tensor: torch.Tensor) -> ttnn.Tensor:
-        """
-        Convert a PyTorch tensor to a TT tensor on device.
-
-        Args:
-            tensor: PyTorch tensor to convert
-
-        Returns:
-            TT tensor on device
-        """
-        # Simple conversion without mesh mappers
         return ttnn.from_torch(
             tensor,
-            device=self.device,
+            device=self.mesh_device,
             dtype=ttnn.bfloat16,
             layout=ttnn.TILE_LAYOUT,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh_device),
         )
 
     def get_weight_shapes(self) -> dict[str, tuple]:
-        """
-        Get shapes of all loaded weights.
-
-        Returns:
-            Dictionary mapping weight names to shapes
-        """
         return {
             "q_a_proj.weight": tuple(self.q_a_proj_weight.shape),
             "q_a_layernorm.weight": tuple(self.q_a_layernorm_weight.shape),
@@ -117,32 +81,11 @@ class MLASimple:
             "o_proj.weight": tuple(self.o_proj_weight.shape),
         }
 
-    def __del__(self):
-        """Cleanup when module is deleted."""
-        # TT tensors will be automatically cleaned up
-
 
 def create_mla_simple(
     config: PretrainedConfig,
     state_dict: dict[str, torch.Tensor],
-    device: ttnn.Device,
+    mesh_device: ttnn.MeshDevice,
     layer_idx: int = 0,
 ) -> MLASimple:
-    """
-    Factory function to create a simple MLA module.
-
-    Args:
-        config: DeepSeek V3 configuration
-        state_dict: Dictionary of weights (dequantized, in bfloat16)
-        device: TT device to load weights onto
-        layer_idx: Layer index (default: 0)
-
-    Returns:
-        MLASimple instance with weights loaded
-
-    Example:
-        >>> device = ttnn.open_device(device_id=0)
-        >>> mla = create_mla_simple(config, state_dict, device)
-        >>> shapes = mla.get_weight_shapes()
-    """
-    return MLASimple(config, state_dict, device, layer_idx)
+    return MLASimple(config, state_dict, mesh_device, layer_idx)
