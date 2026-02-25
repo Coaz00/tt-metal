@@ -10,29 +10,21 @@ import pytest
 import torch
 from loguru import logger
 
-import ttnn
 from models.demos.deepseek_v3.reference.configuration_deepseek import DeepseekV3Config
 from models.demos.deepseek_v3_d_p.reference.mla_reference import create_mla_reference
 from models.demos.deepseek_v3_d_p.tt.mla import create_mla_simple
 
 
-@pytest.fixture(scope="function")
-def device():
-    """
-    Create a single TT device for testing.
-    """
-    device_id = 0
-    device = ttnn.open_device(device_id=device_id)
-    logger.info(f"Opened TT device {device_id}")
-    yield device
-    ttnn.close_device(device)
-    logger.info(f"Closed TT device {device_id}")
-
-
 @pytest.fixture
-def test_config():
-    """Create a test configuration for MLA."""
-    return DeepseekV3Config(
+def random_weights():
+    """
+    Generate random weights for testing.
+
+    Returns:
+        Dictionary of weights in bfloat16
+    """
+    torch.manual_seed(42)
+    test_config = DeepseekV3Config(
         vocab_size=129280,
         hidden_size=7168,
         num_attention_heads=128,
@@ -48,17 +40,6 @@ def test_config():
         attention_bias=False,
         attention_dropout=0.0,
     )
-
-
-@pytest.fixture
-def random_weights(test_config):
-    """
-    Generate random weights for testing.
-
-    Returns:
-        Dictionary of weights in bfloat16
-    """
-    torch.manual_seed(42)
 
     # Generate random weights matching MLA architecture
     weights = {
@@ -94,7 +75,7 @@ def random_weights(test_config):
 class TestMLAInstantiation:
     """Test suite for MLA module instantiation (CPU and TT)."""
 
-    def test_instantiate_reference_mla(self, test_config, random_weights):
+    def test_instantiate_reference_mla(self, random_weights):
         """
         Test instantiating reference CPU MLA module with random weights.
 
@@ -105,6 +86,23 @@ class TestMLAInstantiation:
         logger.info("=" * 80)
         logger.info("Test: Instantiate Reference CPU MLA Module")
         logger.info("=" * 80)
+
+        test_config = DeepseekV3Config(
+            vocab_size=129280,
+            hidden_size=7168,
+            num_attention_heads=128,
+            num_key_value_heads=128,
+            kv_lora_rank=512,
+            q_lora_rank=1536,
+            qk_rope_head_dim=64,
+            v_head_dim=128,
+            qk_nope_head_dim=128,
+            max_position_embeddings=4096,
+            rms_norm_eps=1e-6,
+            rope_theta=10000.0,
+            attention_bias=False,
+            attention_dropout=0.0,
+        )
 
         # Create reference MLA with random weights
         mla_ref = create_mla_reference(
@@ -128,7 +126,7 @@ class TestMLAInstantiation:
 
         logger.success("✓ Reference MLA instantiation successful")
 
-    def test_instantiate_tt_mla(self, test_config, random_weights, device):
+    def test_instantiate_tt_mla(self, random_weights, device):
         """
         Test instantiating TT device MLA module with random weights.
 
@@ -140,6 +138,23 @@ class TestMLAInstantiation:
         logger.info("=" * 80)
         logger.info("Test: Instantiate TT Device MLA Module")
         logger.info("=" * 80)
+
+        test_config = DeepseekV3Config(
+            vocab_size=129280,
+            hidden_size=7168,
+            num_attention_heads=128,
+            num_key_value_heads=128,
+            kv_lora_rank=512,
+            q_lora_rank=1536,
+            qk_rope_head_dim=64,
+            v_head_dim=128,
+            qk_nope_head_dim=128,
+            max_position_embeddings=4096,
+            rms_norm_eps=1e-6,
+            rope_theta=10000.0,
+            attention_bias=False,
+            attention_dropout=0.0,
+        )
 
         # Create TT MLA with same random weights
         mla_tt = create_mla_simple(
@@ -163,7 +178,7 @@ class TestMLAInstantiation:
 
         logger.success("✓ TT MLA instantiation successful")
 
-    def test_instantiate_both_mla_modules(self, test_config, random_weights, device):
+    def test_instantiate_both_mla_modules(self, random_weights, device):
         """
         Test instantiating both reference and TT MLA modules with the same weights.
 
@@ -180,6 +195,23 @@ class TestMLAInstantiation:
         logger.info("=" * 80)
         logger.info("Test: Instantiate Both Reference and TT MLA Modules")
         logger.info("=" * 80)
+
+        test_config = DeepseekV3Config(
+            vocab_size=129280,
+            hidden_size=7168,
+            num_attention_heads=128,
+            num_key_value_heads=128,
+            kv_lora_rank=512,
+            q_lora_rank=1536,
+            qk_rope_head_dim=64,
+            v_head_dim=128,
+            qk_nope_head_dim=128,
+            max_position_embeddings=4096,
+            rms_norm_eps=1e-6,
+            rope_theta=10000.0,
+            attention_bias=False,
+            attention_dropout=0.0,
+        )
 
         # Create reference MLA
         logger.info("Creating reference CPU MLA...")
@@ -234,7 +266,7 @@ class TestMLAInstantiation:
 
         logger.success("✓ Both MLA modules instantiated successfully with consistent weights")
 
-    def test_tt_mla_weight_dtypes(self, test_config, random_weights, device):
+    def test_tt_mla_weight_dtypes(self, random_weights, device):
         """
         Test that TT MLA weights are in correct dtype (bfloat16).
 
@@ -246,6 +278,23 @@ class TestMLAInstantiation:
         logger.info("=" * 80)
         logger.info("Test: TT MLA Weight Dtypes")
         logger.info("=" * 80)
+
+        test_config = DeepseekV3Config(
+            vocab_size=129280,
+            hidden_size=7168,
+            num_attention_heads=128,
+            num_key_value_heads=128,
+            kv_lora_rank=512,
+            q_lora_rank=1536,
+            qk_rope_head_dim=64,
+            v_head_dim=128,
+            qk_nope_head_dim=128,
+            max_position_embeddings=4096,
+            rms_norm_eps=1e-6,
+            rope_theta=10000.0,
+            attention_bias=False,
+            attention_dropout=0.0,
+        )
 
         # Create TT MLA
         mla_tt = create_mla_simple(
@@ -262,7 +311,7 @@ class TestMLAInstantiation:
         logger.success("✓ TT MLA weight dtype test passed")
 
     @pytest.mark.parametrize("use_pretrained", [False, True], ids=["random", "pretrained"])
-    def test_mla_with_both_weight_types(self, use_pretrained, test_config, random_weights, pretrained_weights, device):
+    def test_mla_with_both_weight_types(self, use_pretrained, random_weights, pretrained_weights, device):
         """
         Test MLA instantiation with both random and pretrained weights.
 
@@ -272,11 +321,26 @@ class TestMLAInstantiation:
 
         Args:
             use_pretrained: Whether to use pretrained weights
-            test_config: Test configuration
             random_weights: Random weights for testing
             pretrained_weights: Pretrained weights (or skipped if not available)
             device: TT device
         """
+        test_config = DeepseekV3Config(
+            vocab_size=129280,
+            hidden_size=7168,
+            num_attention_heads=128,
+            num_key_value_heads=128,
+            kv_lora_rank=512,
+            q_lora_rank=1536,
+            qk_rope_head_dim=64,
+            v_head_dim=128,
+            qk_nope_head_dim=128,
+            max_position_embeddings=4096,
+            rms_norm_eps=1e-6,
+            rope_theta=10000.0,
+            attention_bias=False,
+            attention_dropout=0.0,
+        )
         weight_type = "Pretrained" if use_pretrained else "Random"
         logger.info("=" * 80)
         logger.info(f"Test: MLA with {weight_type} Weights")
@@ -319,13 +383,12 @@ class TestMLAInstantiation:
         logger.success(f"✓ TT MLA with {weight_type} weights test passed")
 
     @pytest.mark.parametrize("use_pretrained", [False, True], ids=["random", "pretrained"])
-    def test_reference_and_tt_comparison(self, use_pretrained, test_config, random_weights, pretrained_weights, device):
+    def test_reference_and_tt_comparison(self, use_pretrained, random_weights, pretrained_weights, device):
         """
         Test comparing reference and TT MLA modules with same weights.
 
         Args:
             use_pretrained: Whether to use pretrained weights
-            test_config: Test configuration
             random_weights: Random weights for testing
             pretrained_weights: Pretrained weights (or skipped if not available)
             device: TT device
@@ -334,6 +397,23 @@ class TestMLAInstantiation:
         logger.info("=" * 80)
         logger.info(f"Test: Reference vs TT Comparison ({weight_type} Weights)")
         logger.info("=" * 80)
+
+        test_config = DeepseekV3Config(
+            vocab_size=129280,
+            hidden_size=7168,
+            num_attention_heads=128,
+            num_key_value_heads=128,
+            kv_lora_rank=512,
+            q_lora_rank=1536,
+            qk_rope_head_dim=64,
+            v_head_dim=128,
+            qk_nope_head_dim=128,
+            max_position_embeddings=4096,
+            rms_norm_eps=1e-6,
+            rope_theta=10000.0,
+            attention_bias=False,
+            attention_dropout=0.0,
+        )
 
         if use_pretrained:
             config, weights = pretrained_weights
