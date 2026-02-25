@@ -7,7 +7,6 @@
 #include "socket_benchmark_defs.h"
 
 void kernel_main() {
-    // Get this value from MeshSocket struct on host
     constexpr uint32_t socket_config_addr = get_compile_time_arg_val(0);
     constexpr uint32_t local_l1_buffer_addr = get_compile_time_arg_val(1);
     constexpr uint32_t page_size = get_compile_time_arg_val(2);
@@ -15,7 +14,6 @@ void kernel_main() {
     constexpr uint32_t measurement_buffer_addr = get_compile_time_arg_val(4);
     constexpr uint32_t num_iterations = get_compile_time_arg_val(5);
 
-    // Get Receiver Side Data Cores through RTAs populated by host Socket Queries
     SocketSenderInterface sender_socket = create_sender_socket_interface(socket_config_addr);
 
     uint32_t pcie_xy_enc = sender_socket.d2h.pcie_xy_enc;
@@ -23,28 +21,33 @@ void kernel_main() {
 
     set_sender_socket_page_size(sender_socket, page_size);
 
+    uint32_t data_addr = local_l1_buffer_addr;
     uint64_t pcie_base_addr = (static_cast<uint64_t>(data_addr_hi) << 32) | sender_socket.downstream_fifo_addr;
 
-    uint64_t start_timestamp = get_timestamp();
+    // Warmup: WARMUP_ITERS untimed iterations to flush cold-cache effects
+    for (uint32_t w = 0; w < WARMUP_ITERS; w++) {
+        socket_reserve_pages(sender_socket, 1);
+        noc_write_page_chunked(pcie_xy_enc, data_addr, pcie_base_addr + sender_socket.write_ptr, page_size);
+        socket_push_pages(sender_socket, 1);
+        socket_notify_receiver(sender_socket);
+        socket_barrier(sender_socket);
+    }
 
     for (uint32_t i = 0; i < num_iterations; i++) {
-        uint32_t data_addr = local_l1_buffer_addr;
-        uint32_t outstanding_data_size = data_size;
-        while (outstanding_data_size) {
-            socket_reserve_pages(sender_socket, 1);
-            // write_ptr is a relative offset into the downstream FIFO
-            noc_write_page_chunked(pcie_xy_enc, data_addr, pcie_base_addr + sender_socket.write_ptr, page_size);
-            data_addr += page_size;
-            outstanding_data_size -= page_size;
-            socket_push_pages(sender_socket, 1);
-            socket_notify_receiver(sender_socket);
-        }
+        uint64_t start_timestamp = get_timestamp();
+
+        socket_reserve_pages(sender_socket, 1);
+        noc_write_page_chunked(pcie_xy_enc, data_addr, pcie_base_addr + sender_socket.write_ptr, page_size);
+        socket_push_pages(sender_socket, 1);
+        socket_notify_receiver(sender_socket);
+        socket_barrier(sender_socket);
+
+        uint64_t end_timestamp = get_timestamp();
+        *reinterpret_cast<volatile uint64_t*>(measurement_buffer_addr + i * sizeof(uint64_t)) =
+            end_timestamp - start_timestamp;
     }
     socket_barrier(sender_socket);
+    noc_async_write_barrier();
 
-    uint64_t end_timestamp = get_timestamp();
-    *reinterpret_cast<volatile uint64_t*>(measurement_buffer_addr) = end_timestamp - start_timestamp;
-
-    // Write updated socket configs to the L1 config buffer (were cached on stack during kernel execution)
     update_socket_config(sender_socket);
 }
