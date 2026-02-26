@@ -39,10 +39,13 @@ on:
       recalculate_weights_cache:
         description: 'Recalculate weights cache in a new directory'
         required: false
-        default: false
-        type: boolean
+        type: choice
+        default: "No"
+        options:
+          - "No"
+          - "Yes"
       new_cache_dir:
-        description: 'New cache subdirectory name (under DeepSeek-R1-0528-Cache/). Required when recalculate_weights_cache is true.'
+        description: 'New cache subdirectory name (under DeepSeek-R1-0528-Cache/). Required when recalculate_weights_cache is Yes.'
         required: false
         type: string
         default: ''
@@ -118,7 +121,7 @@ jobs:
         id: cache-config
         run: |
           CACHE_BASE="/mnt/MLPerf/tt_dnn-models/deepseek-ai/DeepSeek-R1-0528-Cache"
-          if [[ "${{ inputs.recalculate_weights_cache }}" == "true" && -n "${{ inputs.new_cache_dir }}" ]]; then
+          if [[ "${{ inputs.recalculate_weights_cache }}" == "Yes" && -n "${{ inputs.new_cache_dir }}" ]]; then
             NEW_DIR="${CACHE_BASE}/${{ inputs.new_cache_dir }}"
             echo "Creating new cache directory: ${NEW_DIR}"
             mkdir -p "${NEW_DIR}"
