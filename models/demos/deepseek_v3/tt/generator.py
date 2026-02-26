@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, List, Tuple
@@ -102,11 +103,20 @@ class DeepseekGenerator(WarmupForwardMixin):
         force_recalculate: bool = False,
         profile_decode: bool = False,
         sample_on_device: bool = True,
+        dump_host_logits: bool = False,
+        dump_host_logits_dir: str | Path | None = None,
     ) -> None:
+        seed = 123
+        torch.manual_seed(seed)
+        ttnn.manual_seed(seeds=seed, device=mesh_device)
+
         self.mesh_device = mesh_device
         self.model_path = str(model_path)
         self.cache_dir = cache_dir
         self.sample_on_device = sample_on_device
+        self.dump_host_logits = dump_host_logits
+        self._logits_dump_dir = Path(dump_host_logits_dir) if dump_host_logits_dir is not None else None
+        self._rank = os.getenv("OMPI_COMM_WORLD_RANK") or os.getenv("PMI_RANK") or os.getenv("RANK") or "0"
 
         # Load HF config + tokenizer
         self.hf_config = (
@@ -139,6 +149,9 @@ class DeepseekGenerator(WarmupForwardMixin):
         # Tokenizer is optional; caller can pass a tokenizer or handle failure.
         self.tokenizer = tokenizer
 
+        logger.info(f"num_hidden_layers: {self.hf_config.num_hidden_layers}")
+        logger.info(f"max_seq_len: {self.hf_config.max_seq_len}")
+
         # Runtime helpers
         self.ccl = CCL(mesh_device)
         mesh_shape = list(mesh_device.shape)
@@ -168,6 +181,11 @@ class DeepseekGenerator(WarmupForwardMixin):
 
         # Log sampling mode
         logger.info(f"Sampling mode: {'device' if self.sample_on_device else 'host'}")
+        if self.dump_host_logits:
+            if self._logits_dump_dir is None:
+                self._logits_dump_dir = Path(self.cache_dir) / "debug_host_logits"
+            self._logits_dump_dir.mkdir(parents=True, exist_ok=True)
+            logger.info(f"Host logits dump enabled: {self._logits_dump_dir} (rank={self._rank})")
 
         # Model runtime state
         self.model_state = None
@@ -662,6 +680,36 @@ class DeepseekGenerator(WarmupForwardMixin):
         )
         return logits  # [1, 1, B, V]
 
+    def _maybe_dump_host_logits(
+        self,
+        logits_host: torch.Tensor,
+        *,
+        stage: str,
+        repeat_idx: int,
+        mode: str,
+        user_id: int | None = None,
+        gen_idx: int | None = None,
+    ) -> None:
+        if not self.dump_host_logits or self._logits_dump_dir is None:
+            return
+        name_parts = [f"rank{self._rank}", f"mode_{mode}", stage, f"repeat_{repeat_idx:03d}"]
+        if user_id is not None:
+            name_parts.append(f"user_{user_id:03d}")
+        if gen_idx is not None:
+            name_parts.append(f"step_{gen_idx:04d}")
+        out_path = self._logits_dump_dir / ("__".join(name_parts) + ".pt")
+        payload = {
+            "stage": stage,
+            "repeat_idx": repeat_idx,
+            "user_id": user_id,
+            "gen_idx": gen_idx,
+            "mode": mode,
+            "shape": tuple(logits_host.shape),
+            "dtype": str(logits_host.dtype),
+            "logits": logits_host.detach().cpu(),
+        }
+        torch.save(payload, out_path)
+
     def _decode_step_tt(
         self,
         tt_tokens: ttnn.Tensor,
@@ -797,7 +845,7 @@ class DeepseekGenerator(WarmupForwardMixin):
             teacher_forcing = None
 
         # Run one or more prefill+decode batches
-        for _ in range(repeat_batches):
+        for repeat_idx in range(repeat_batches):
             # Reset teacher-forcing state per batch.
             if teacher_forcing is not None:
                 teacher_forcing.reset()
@@ -840,6 +888,17 @@ class DeepseekGenerator(WarmupForwardMixin):
                     assert prefill_logits is not None
                     last_logits = self._slice_last_token_logits(prefill_logits, prompt_len)
                     last_logits = self._expand_prefill_logits(last_logits)
+                    host_last_logits_for_debug = None
+                    if self.dump_host_logits:
+                        host_last_logits_for_debug = self._logits_to_host(last_logits)
+                        self._maybe_dump_host_logits(
+                            host_last_logits_for_debug,
+                            stage="prefill",
+                            repeat_idx=repeat_idx,
+                            mode="device" if self.sample_on_device else "host",
+                            user_id=user_id,
+                            gen_idx=0,
+                        )
 
                     if self.sample_on_device:
                         # Device sampling (new way)
@@ -849,7 +908,11 @@ class DeepseekGenerator(WarmupForwardMixin):
                         ttnn.deallocate(tt_pred)
                     else:
                         # Host sampling (old way)
-                        host_logits = self._logits_to_host(last_logits)
+                        host_logits = (
+                            host_last_logits_for_debug
+                            if host_last_logits_for_debug is not None
+                            else self._logits_to_host(last_logits)
+                        )
                         sampled_tokens = self._sample_greedy(host_logits)  # [B]
                         pred_token = sampled_tokens[0]  # Get first token
 
@@ -917,6 +980,7 @@ class DeepseekGenerator(WarmupForwardMixin):
                 for gen_idx in range(decode_steps):
                     logger.info(f"Decoding step {gen_idx} for {num_of_prompts} user(s)...")
                     profiler.start(f"decode_time_{gen_idx}")
+                    host_decode_logits = None
 
                     if self.enable_trace:
                         # Trace mode (always uses device sampling)
@@ -944,6 +1008,18 @@ class DeepseekGenerator(WarmupForwardMixin):
                         logits_tt = self._decode_step(next_tokens, positions, self.batch_size_per_row)
                         logits = self._logits_to_host(logits_tt)
                         ttnn.deallocate(logits_tt)
+
+                    if self.dump_host_logits:
+                        host_decode_logits = (
+                            logits if isinstance(logits, torch.Tensor) else self._logits_to_host(logits)
+                        )
+                        self._maybe_dump_host_logits(
+                            host_decode_logits,
+                            stage="decode",
+                            repeat_idx=repeat_idx,
+                            mode="device" if self.sample_on_device else "host",
+                            gen_idx=gen_idx,
+                        )
 
                     profiler.end(f"decode_time_{gen_idx}")
                     self.ccl.reset_sem_counters()

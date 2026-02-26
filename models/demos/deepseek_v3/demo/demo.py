@@ -150,6 +150,17 @@ def create_parser() -> argparse.ArgumentParser:
         default=True,
         help="Disable sampling on device and use host-side sampling instead (default: device sampling is enabled).",
     )
+    p.add_argument(
+        "--dump-host-logits",
+        action="store_true",
+        default=False,
+        help="Dump host logits for prefill/decode to files for debugging/comparison.",
+    )
+    p.add_argument(
+        "--dump-host-logits-dir",
+        type=str,
+        help="Directory to write dumped host logits. Defaults to <cache-dir>/debug_host_logits if omitted.",
+    )
     return p
 
 
@@ -268,6 +279,8 @@ def run_demo(
     prefill_max_tokens: int = None,
     profile_decode: bool = False,
     sample_on_device: bool = True,
+    dump_host_logits: bool = False,
+    dump_host_logits_dir: str | Path | None = None,
 ) -> dict:
     """Programmatic entrypoint for the DeepSeek-V3 demo.
 
@@ -368,6 +381,8 @@ def run_demo(
                 prefill_max_tokens=prefill_max_tokens,
                 profile_decode=profile_decode,
                 sample_on_device=sample_on_device,
+                dump_host_logits=dump_host_logits,
+                dump_host_logits_dir=dump_host_logits_dir,
             )
         # Build the prompt list
         pre_tokenized_prompts = None
@@ -471,6 +486,8 @@ def main() -> None:
         prefill_max_tokens=args.prefill_max_tokens,
         profile_decode=args.profile_decode,
         sample_on_device=args.sample_on_device,
+        dump_host_logits=args.dump_host_logits,
+        dump_host_logits_dir=args.dump_host_logits_dir,
     )
 
     # If prompts were loaded from a JSON file, save output to JSON file instead of printing
