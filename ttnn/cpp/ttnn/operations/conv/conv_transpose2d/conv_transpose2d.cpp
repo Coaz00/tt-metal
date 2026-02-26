@@ -849,6 +849,97 @@ Result conv_transpose2d_DRAM(
         input_height, input_width, kernel_size, stride, padding, output_padding, dilation);
     auto padding_n4 = sliding_window::get_pair_n4_padding(padding);
 
+    // Early auto-determination: If auto-slicing is requested (num_slices=0), determine the configuration
+    // before deciding L1 vs DRAM path. This prevents double-preparation of weights when auto-slicing
+    // determines that L1 path should be used.
+    std::optional<Conv2dSliceConfig> effective_slice_config = dram_slice_config_;
+    if (dram_slice_config_.has_value() && dram_slice_config_->num_slices == 0) {
+        log_debug(tt::LogOp, "Early auto-determination for DRAM conv_transpose2d");
+        // We need to determine the slice config before deciding the execution path
+        // Create temporary dummy tensors just for auto-determination
+        auto temp_input = create_device_tensor(
+            TensorSpec(
+                ttnn::Shape({batch_size, input_height, input_width, in_channels}),
+                tt::tt_metal::TensorLayout(
+                    input_tensor.dtype(),
+                    tt::tt_metal::PageConfig(Layout::ROW_MAJOR),
+                    MemoryConfig{TensorMemoryLayout::INTERLEAVED, BufferType::DRAM})),
+            device);
+        auto temp_output = create_device_tensor(
+            TensorSpec(
+                ttnn::Shape({batch_size, dims.output_height, dims.output_width, out_channels}),
+                tt::tt_metal::TensorLayout(
+                    output_dtype,
+                    tt::tt_metal::PageConfig(conv_config.output_layout),
+                    MemoryConfig{TensorMemoryLayout::INTERLEAVED, BufferType::DRAM})),
+            device);
+
+        auto temp_slice_attr =
+            std::unique_ptr<ttnn::operations::op_slicing::OpSliceAttr>(get_conv_transpose2d_slice_attr(
+                batch_size,
+                input_height,
+                input_width,
+                in_channels,
+                out_channels,
+                kernel_size,
+                stride,
+                padding_n4,
+                output_padding,
+                dilation,
+                groups,
+                input_tensor.layout(),
+                input_tensor.dtype(),
+                output_dtype,
+                std::ref(temp_input),  // dummy weight
+                std::nullopt,          // dummy bias
+                conv_config,
+                compute_config,
+                device,
+                mirror_kernel));
+
+        effective_slice_config = ttnn::operations::op_slicing::determine_slice_config(
+            temp_slice_attr.get(),
+            temp_input.logical_shape(),
+            temp_output.logical_shape(),
+            dram_slice_config_,
+            conv_config.output_layout,
+            device);
+
+        log_debug(tt::LogOp, "Early auto-determined slice config: {}", effective_slice_config.value());
+
+        // Clean up temporary tensors
+        temp_input.deallocate();
+        temp_output.deallocate();
+
+        // If auto-determination results in num_slices==1, convert to L1_FULL
+        // This signals that the operation fits entirely in L1 and should use the L1 path
+        if (effective_slice_config->num_slices == 1) {
+            log_debug(tt::LogOp, "Early auto-determined num_slices=1, using L1 path for conv_transpose2d");
+            // Call L1 version directly to avoid double-preparation of weights
+            return conv_transpose2d_L1(
+                input_tensor,
+                weight_tensor,
+                device,
+                in_channels,
+                out_channels,
+                batch_size,
+                input_height,
+                input_width,
+                kernel_size,
+                stride,
+                padding,
+                output_padding,
+                dilation,
+                groups,
+                dtype,
+                bias_tensor,
+                conv_config_,
+                compute_config_,
+                memory_config_,
+                mirror_kernel);
+        }
+    }
+
     log_debug(tt::LogOp, "Input : {}x{}", input_height, input_width);
     log_debug(tt::LogOp, "Output : {}x{}", dims.output_height, dims.output_width);
 

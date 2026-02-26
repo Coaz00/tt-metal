@@ -314,6 +314,13 @@ void run_sliced_op(
             output_layout,
             input_tensor.device());
         log_info(tt::LogOp, "Auto determined DRAM Slice Config as {} for {}", dram_slice_config, op_slice_attr->name());
+
+        // If auto-determination resulted in num_slices==1, convert to L1_FULL to avoid DRAM slicing overhead
+        // A single slice means the entire operation fits in L1, so we should use the L1 path instead
+        if (dram_slice_config.num_slices == 1) {
+            log_debug(tt::LogOp, "Auto-determined num_slices=1, converting to L1_FULL for {}", op_slice_attr->name());
+            dram_slice_config.slice_type = Op2DSliceConfig::SliceType::L1_FULL;
+        }
     }
 
     TT_FATAL(
