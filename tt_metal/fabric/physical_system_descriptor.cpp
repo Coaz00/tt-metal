@@ -6,11 +6,13 @@
 #include <algorithm>
 #include <set>
 #include <fstream>
+#include <climits>
 
 #include <tt-metalium/experimental/fabric/physical_system_descriptor.hpp>
 #include "tt_metal/fabric/serialization/physical_system_descriptor_serialization.hpp"
+#include <tt_stl/assert.hpp>
+#include "llrt/tt_target_device.hpp"
 #include <unistd.h>
-#include <limits.h>
 
 namespace tt::tt_metal {
 
@@ -43,7 +45,7 @@ PhysicalSystemDescriptor::PhysicalSystemDescriptor(tt::TargetDevice target_devic
     target_device_type_(target_device_type) {}
 
 PhysicalSystemDescriptor::PhysicalSystemDescriptor(const std::string& mock_proto_desc_path) :
-    target_device_type_(TargetDevice::Silicon) {
+    target_device_type_(tt::TargetDevice::Silicon) {
     auto proto_desc = deserialize_physical_system_descriptor_from_text_proto_file(mock_proto_desc_path);
     this->merge(std::move(proto_desc));
 }
@@ -377,9 +379,8 @@ std::string PhysicalSystemDescriptor::my_host_name() const {
         // Discovery has set local_hostname_ and local_rank_
         if (all_hostnames_unique_) {
             return local_hostname_;
-        } else {
-            return local_hostname_ + "_" + std::to_string(local_rank_);
         }
+        return local_hostname_ + "_" + std::to_string(local_rank_);
     }
     // Fallback for file-based PSD (no discovery) - assume hostnames are unique
     return get_host_name();
