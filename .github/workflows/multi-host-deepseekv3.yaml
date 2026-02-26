@@ -36,6 +36,16 @@ on:
         required: false
         default: false
         type: boolean
+      recalculate_weights_cache:
+        description: 'Recalculate weights cache in a new directory'
+        required: false
+        default: false
+        type: boolean
+      new_cache_dir:
+        description: 'New cache subdirectory name (under DeepSeek-R1-0528-Cache/). Required when recalculate_weights_cache is true.'
+        required: false
+        type: string
+        default: ''
       platform:
         required: false
         type: choice
@@ -104,6 +114,22 @@ jobs:
         id: capture-home
         run: echo "home=${HOME}" >> $GITHUB_OUTPUT
 
+      - name: Prepare custom weights cache directory
+        id: cache-config
+        run: |
+          CACHE_BASE="/mnt/MLPerf/tt_dnn-models/deepseek-ai/DeepSeek-R1-0528-Cache"
+          if [[ "${{ inputs.recalculate_weights_cache }}" == "true" && -n "${{ inputs.new_cache_dir }}" ]]; then
+            NEW_DIR="${CACHE_BASE}/${{ inputs.new_cache_dir }}"
+            echo "Creating new cache directory: ${NEW_DIR}"
+            mkdir -p "${NEW_DIR}"
+            echo "Copying test_io_cache from CI directory..."
+            cp -r "${CACHE_BASE}/CI/test_io_cache" "${NEW_DIR}/test_io_cache"
+            chmod -R a+rwX "${NEW_DIR}"
+            echo "cache_override=${NEW_DIR}" >> $GITHUB_OUTPUT
+          else
+            echo "cache_override=" >> $GITHUB_OUTPUT
+          fi
+
       # ── DeepSeek V3 unit tests ──────────────────────────────────────────
       - name: Run dual DeepSeek V3 unit tests
         if: ${{ inputs.deepseekv3_unit_tests && (inputs.setup == 'dual' || inputs.setup == 'both') }}
@@ -119,6 +145,7 @@ jobs:
             -e ARCH_NAME=wormhole_b0
             -e TT_METAL_ENABLE_ERISC_IRAM="1"
             -e GTEST_OUTPUT="xml:${{ github.workspace }}/generated/test_reports/"
+            -e DEEPSEEK_V3_CACHE_OVERRIDE=${{ steps.cache-config.outputs.cache_override }}
             -v /etc/mpirun:/etc/mpirun:ro
             -v ${{ steps.capture-home.outputs.home }}/.ssh:${{ steps.capture-home.outputs.home }}/.ssh:ro
             --device /dev/tenstorrent
@@ -143,6 +170,7 @@ jobs:
             -e ARCH_NAME=wormhole_b0
             -e TT_METAL_ENABLE_ERISC_IRAM="1"
             -e GTEST_OUTPUT="xml:${{ github.workspace }}/generated/test_reports/"
+            -e DEEPSEEK_V3_CACHE_OVERRIDE=${{ steps.cache-config.outputs.cache_override }}
             -v /etc/mpirun:/etc/mpirun:ro
             -v ${{ steps.capture-home.outputs.home }}/.ssh:${{ steps.capture-home.outputs.home }}/.ssh:ro
             --device /dev/tenstorrent
@@ -168,6 +196,7 @@ jobs:
             -e ARCH_NAME=wormhole_b0
             -e TT_METAL_ENABLE_ERISC_IRAM="1"
             -e GTEST_OUTPUT="xml:${{ github.workspace }}/generated/test_reports/"
+            -e DEEPSEEK_V3_CACHE_OVERRIDE=${{ steps.cache-config.outputs.cache_override }}
             -v /etc/mpirun:/etc/mpirun:ro
             -v ${{ steps.capture-home.outputs.home }}/.ssh:${{ steps.capture-home.outputs.home }}/.ssh:ro
             --device /dev/tenstorrent
@@ -192,6 +221,7 @@ jobs:
             -e ARCH_NAME=wormhole_b0
             -e TT_METAL_ENABLE_ERISC_IRAM="1"
             -e GTEST_OUTPUT="xml:${{ github.workspace }}/generated/test_reports/"
+            -e DEEPSEEK_V3_CACHE_OVERRIDE=${{ steps.cache-config.outputs.cache_override }}
             -v /etc/mpirun:/etc/mpirun:ro
             -v ${{ steps.capture-home.outputs.home }}/.ssh:${{ steps.capture-home.outputs.home }}/.ssh:ro
             --device /dev/tenstorrent
@@ -217,6 +247,7 @@ jobs:
             -e ARCH_NAME=wormhole_b0
             -e TT_METAL_ENABLE_ERISC_IRAM="1"
             -e GTEST_OUTPUT="xml:${{ github.workspace }}/generated/test_reports/"
+            -e DEEPSEEK_V3_CACHE_OVERRIDE=${{ steps.cache-config.outputs.cache_override }}
             -v /etc/mpirun:/etc/mpirun:ro
             -v ${{ steps.capture-home.outputs.home }}/.ssh:${{ steps.capture-home.outputs.home }}/.ssh:ro
             --device /dev/tenstorrent
@@ -251,6 +282,7 @@ jobs:
             -e ARCH_NAME=wormhole_b0
             -e TT_METAL_ENABLE_ERISC_IRAM="1"
             -e GTEST_OUTPUT="xml:${{ github.workspace }}/generated/test_reports/"
+            -e DEEPSEEK_V3_CACHE_OVERRIDE=${{ steps.cache-config.outputs.cache_override }}
             -v /etc/mpirun:/etc/mpirun:ro
             -v ${{ steps.capture-home.outputs.home }}/.ssh:${{ steps.capture-home.outputs.home }}/.ssh:ro
             --device /dev/tenstorrent
@@ -286,6 +318,7 @@ jobs:
             -e ARCH_NAME=wormhole_b0
             -e TT_METAL_ENABLE_ERISC_IRAM="1"
             -e GTEST_OUTPUT="xml:${{ github.workspace }}/generated/test_reports/"
+            -e DEEPSEEK_V3_CACHE_OVERRIDE=${{ steps.cache-config.outputs.cache_override }}
             -v /etc/mpirun:/etc/mpirun:ro
             -v ${{ steps.capture-home.outputs.home }}/.ssh:${{ steps.capture-home.outputs.home }}/.ssh:ro
             --device /dev/tenstorrent
@@ -320,6 +353,7 @@ jobs:
             -e ARCH_NAME=wormhole_b0
             -e TT_METAL_ENABLE_ERISC_IRAM="1"
             -e GTEST_OUTPUT="xml:${{ github.workspace }}/generated/test_reports/"
+            -e DEEPSEEK_V3_CACHE_OVERRIDE=${{ steps.cache-config.outputs.cache_override }}
             -v /etc/mpirun:/etc/mpirun:ro
             -v ${{ steps.capture-home.outputs.home }}/.ssh:${{ steps.capture-home.outputs.home }}/.ssh:ro
             --device /dev/tenstorrent
@@ -355,6 +389,7 @@ jobs:
             -e ARCH_NAME=wormhole_b0
             -e TT_METAL_ENABLE_ERISC_IRAM="1"
             -e GTEST_OUTPUT="xml:${{ github.workspace }}/generated/test_reports/"
+            -e DEEPSEEK_V3_CACHE_OVERRIDE=${{ steps.cache-config.outputs.cache_override }}
             -v /etc/mpirun:/etc/mpirun:ro
             -v ${{ steps.capture-home.outputs.home }}/.ssh:${{ steps.capture-home.outputs.home }}/.ssh:ro
             --device /dev/tenstorrent
@@ -389,6 +424,7 @@ jobs:
             -e ARCH_NAME=wormhole_b0
             -e TT_METAL_ENABLE_ERISC_IRAM="1"
             -e GTEST_OUTPUT="xml:${{ github.workspace }}/generated/test_reports/"
+            -e DEEPSEEK_V3_CACHE_OVERRIDE=${{ steps.cache-config.outputs.cache_override }}
             -v /etc/mpirun:/etc/mpirun:ro
             -v ${{ steps.capture-home.outputs.home }}/.ssh:${{ steps.capture-home.outputs.home }}/.ssh:ro
             --device /dev/tenstorrent
