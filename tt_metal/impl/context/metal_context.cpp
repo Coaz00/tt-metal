@@ -417,11 +417,6 @@ void MetalContext::teardown() {
     l1_bank_to_noc_xy_.clear();
     worker_logical_col_to_virtual_col_.clear();
     worker_logical_row_to_virtual_row_.clear();
-
-    // Clear mock mode configuration if it was enabled
-    if (experimental::is_mock_mode_registered()) {
-        experimental::disable_mock_mode();
-    }
 }
 
 // MetalContext destructor is private, so we can't use a unique_ptr to manage the instance.
