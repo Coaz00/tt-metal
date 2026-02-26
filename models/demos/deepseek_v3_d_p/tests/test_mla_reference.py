@@ -69,6 +69,12 @@ class TestMLAReference:
             attention_bias=hf_config.attention_bias,
             attention_dropout=hf_config.attention_dropout,
         )
+        # Add quantization_config if it exists in hf_config (needed for dequantize_state_dict)
+        if hasattr(hf_config, "quantization_config") and hf_config.quantization_config is not None:
+            config.quantization_config = hf_config.quantization_config
+        else:
+            # Default quantization config if not present
+            config.quantization_config = {"weight_block_size": [128, 128]}
         return config
 
     @pytest.mark.parametrize("use_pretrained", [True, False], ids=["pretrained_weights", "random_weights"])

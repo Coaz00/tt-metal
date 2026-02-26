@@ -46,54 +46,81 @@ class MLASimple:
         - o_proj.weight
         """
 
+        # Mesh Device = (sp x tp)
+
+        q_a_ln_weight = state_dict["q_a_layernorm.weight"].reshape(1, 1, -1, ttnn.TILE_SIZE)
+        self.q_a_layernorm_weight = self._to_tt_tensor(
+            q_a_ln_weight,
+            ttnn.bfloat16,
+            ttnn.ROW_MAJOR_LAYOUT,
+            ttnn.ReplicateTensorToMesh(self.mesh_device),
+        )
+
+        kv_a_ln_weight = state_dict["kv_a_layernorm.weight"].reshape(1, 1, -1, ttnn.TILE_SIZE)
+        self.kv_a_layernorm_weight = self._to_tt_tensor(
+            kv_a_ln_weight,
+            ttnn.bfloat16,
+            ttnn.ROW_MAJOR_LAYOUT,
+            ttnn.ReplicateTensorToMesh(self.mesh_device),
+        )
+
         q_a_proj = state_dict["q_a_proj.weight"]
         q_a_proj = q_a_proj.transpose(-2, -1)
-        tp_shard_dim = 0
+
+        shard_dims = [None, None]
+        tp_axis = 1
+        sp_axis = 0
+        shard_dims[tp_axis] = 0
         mesh_mapper = ttnn.ShardTensor2dMesh(
-            self.mesh_device, mesh_shape=tuple(self.mesh_device.shape), dims=(None, tp_shard_dim)
+            self.mesh_device, mesh_shape=tuple(self.mesh_device.shape), dims=shard_dims
         )
         self.q_a_proj_weight = self._to_tt_tensor(q_a_proj, ttnn.bfloat8_b, ttnn.TILE_LAYOUT, mesh_mapper)
-        print(f"q_a_proj_weight per device shape: {self.q_a_proj_weight.shape}")
 
-        self.q_a_layernorm_weight = self._to_tt_tensor(
-            state_dict["q_a_layernorm.weight"],
-            ttnn.bfloat16,
-            ttnn.TILE_LAYOUT,
-            ttnn.ReplicateTensorToMesh(self.mesh_device),
-        )  # check this
-        self.kv_a_layernorm_weight = self._to_tt_tensor(
-            state_dict["kv_a_layernorm.weight"],
-            ttnn.bfloat16,
-            ttnn.TILE_LAYOUT,
-            ttnn.ReplicateTensorToMesh(self.mesh_device),
-        )  # check this
+        shard_dims[tp_axis] = 1
+        shard_dims[sp_axis] = None
+        mesh_mapper_q_b_proj = ttnn.ShardTensor2dMesh(
+            self.mesh_device, mesh_shape=tuple(self.mesh_device.shape), dims=shard_dims
+        )
         self.q_b_proj_weight = self._to_tt_tensor(
-            state_dict["q_b_proj.weight"],
+            state_dict["q_b_proj.weight"].transpose(-2, -1),
             ttnn.bfloat8_b,
             ttnn.TILE_LAYOUT,
-            ttnn.ReplicateTensorToMesh(self.mesh_device),
+            mesh_mapper_q_b_proj,
         )
 
-        # KV projection weights
         self.kv_a_proj_with_mqa_weight = self._to_tt_tensor(
-            state_dict["kv_a_proj_with_mqa.weight"],
+            state_dict["kv_a_proj_with_mqa.weight"].transpose(-2, -1),
             ttnn.bfloat8_b,
             ttnn.TILE_LAYOUT,
-            ttnn.ReplicateTensorToMesh(self.mesh_device),
+            mesh_mapper,
         )
-        self.kv_b_proj_weight = self._to_tt_tensor(
-            state_dict["kv_b_proj.weight"],
-            ttnn.bfloat8_b,
-            ttnn.TILE_LAYOUT,
-            ttnn.ReplicateTensorToMesh(self.mesh_device),
+        kv_b_proj_weights = state_dict["kv_b_proj.weight"].reshape(
+            1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim, self.kv_lora_rank
         )
 
-        # Output projection weight
+        torch_weights_k = kv_b_proj_weights[..., : self.qk_nope_head_dim, :].transpose(-2, -1)
+        torch_weights_v = kv_b_proj_weights[..., self.qk_nope_head_dim :, :]
+
+        shard_dims[tp_axis] = 1
+        shard_dims[sp_axis] = None
+        self.wkv_b1_weight = self._to_tt_tensor(
+            torch_weights_k.transpose(-2, -1),
+            ttnn.bfloat8_b,
+            ttnn.TILE_LAYOUT,
+            mesh_mapper_q_b_proj,
+        )
+        self.wkv_b2_weight = self._to_tt_tensor(
+            torch_weights_v.transpose(-2, -1),
+            ttnn.bfloat8_b,
+            ttnn.TILE_LAYOUT,
+            mesh_mapper_q_b_proj,
+        )
+
         self.o_proj_weight = self._to_tt_tensor(
-            state_dict["o_proj.weight"], ttnn.bfloat8_b, ttnn.TILE_LAYOUT, ttnn.ReplicateTensorToMesh(self.mesh_device)
+            state_dict["o_proj.weight"].transpose(-2, -1), ttnn.bfloat8_b, ttnn.TILE_LAYOUT, mesh_mapper
         )
 
-        print(f"✓ Loaded {len(state_dict)} weights to TT device")
+        print(f"✓ Loaded {len(state_dict)} weights in MLA layer {self.layer_idx} to TT device")
 
     def _to_tt_tensor(
         self, tensor: torch.Tensor, dtype: ttnn.DataType, layout: ttnn.Layout, mesh_mapper: ttnn.TensorToMesh
@@ -114,6 +141,7 @@ class MLASimple:
             "q_b_proj.weight": tuple(self.q_b_proj_weight.shape),
             "kv_a_proj_with_mqa.weight": tuple(self.kv_a_proj_with_mqa_weight.shape),
             "kv_a_layernorm.weight": tuple(self.kv_a_layernorm_weight.shape),
-            "kv_b_proj.weight": tuple(self.kv_b_proj_weight.shape),
+            "wkv_b1_weight": tuple(self.wkv_b1_weight.shape),
+            "wkv_b2_weight": tuple(self.wkv_b2_weight.shape),
             "o_proj.weight": tuple(self.o_proj_weight.shape),
         }
