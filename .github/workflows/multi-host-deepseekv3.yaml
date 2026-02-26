@@ -122,7 +122,12 @@ jobs:
         run: |
           CACHE_BASE="/mnt/MLPerf/tt_dnn-models/deepseek-ai/DeepSeek-R1-0528-Cache"
           if [[ "${{ inputs.recalculate_weights_cache }}" == "Yes" && -n "${{ inputs.new_cache_dir }}" ]]; then
-            NEW_DIR="${CACHE_BASE}/${{ inputs.new_cache_dir }}"
+            CLEAN_NAME=$(echo "${{ inputs.new_cache_dir }}" | sed 's|/||g')
+            if [[ "${CLEAN_NAME}" == "CI" ]]; then
+              echo "::error::new_cache_dir cannot be 'CI' — this would overwrite the production cache."
+              exit 1
+            fi
+            NEW_DIR="${CACHE_BASE}/${CLEAN_NAME}"
             echo "Creating new cache directory: ${NEW_DIR}"
             mkdir -p "${NEW_DIR}"
             echo "Copying test_io_cache from CI directory..."

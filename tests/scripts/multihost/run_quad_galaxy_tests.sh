@@ -67,6 +67,10 @@ setup_dual_galaxy_env() {
 
     export DEEPSEEK_V3_HF_MODEL="/mnt/MLPerf/tt_dnn-models/deepseek-ai/DeepSeek-R1-0528"
     if [[ -n "${DEEPSEEK_V3_CACHE_OVERRIDE:-}" ]]; then
+        if [[ "${DEEPSEEK_V3_CACHE_OVERRIDE}" == */CI || "${DEEPSEEK_V3_CACHE_OVERRIDE}" == */CI/ ]]; then
+            echo "Error: DEEPSEEK_V3_CACHE_OVERRIDE must not point to the production CI cache." >&2
+            exit 1
+        fi
         export DEEPSEEK_V3_CACHE="${DEEPSEEK_V3_CACHE_OVERRIDE}"
     else
         export DEEPSEEK_V3_CACHE="/mnt/MLPerf/tt_dnn-models/deepseek-ai/DeepSeek-R1-0528-Cache/CI"
@@ -94,6 +98,10 @@ setup_quad_galaxy_env() {
 
     export DEEPSEEK_V3_HF_MODEL="/mnt/MLPerf/tt_dnn-models/deepseek-ai/DeepSeek-R1-0528"
     if [[ -n "${DEEPSEEK_V3_CACHE_OVERRIDE:-}" ]]; then
+        if [[ "${DEEPSEEK_V3_CACHE_OVERRIDE}" == */CI || "${DEEPSEEK_V3_CACHE_OVERRIDE}" == */CI/ ]]; then
+            echo "Error: DEEPSEEK_V3_CACHE_OVERRIDE must not point to the production CI cache." >&2
+            exit 1
+        fi
         export DEEPSEEK_V3_CACHE="${DEEPSEEK_V3_CACHE_OVERRIDE}"
     else
         export DEEPSEEK_V3_CACHE="/mnt/MLPerf/tt_dnn-models/deepseek-ai/DeepSeek-R1-0528-Cache/CI"
