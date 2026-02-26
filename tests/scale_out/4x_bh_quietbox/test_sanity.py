@@ -10,10 +10,10 @@ from tests.ttnn.utils_for_testing import assert_with_pcc
 
 
 @pytest.mark.parametrize("device_params", [{"fabric_config": ttnn.FabricConfig.FABRIC_2D}], indirect=True)
-@pytest.mark.parametrize("mesh_device", [pytest.param((4, 4), id="4x4_grid")], indirect=True)
+@pytest.mark.parametrize("mesh_device", [pytest.param((1, 16), id="1x16_grid")], indirect=True)
 def test_multihost_sanity(mesh_device):
     torch.manual_seed(0)
-
+    print(f"mesh_device: {mesh_device}")
     shard_size = 32
     torch_tensor = torch.rand(
         (1, 1, shard_size * mesh_device.shape[0], shard_size * mesh_device.shape[1]), dtype=torch.bfloat16
