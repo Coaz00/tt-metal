@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+from abc import ABC, abstractmethod
 from types import NoneType
 from typing import TYPE_CHECKING, Any
 
@@ -13,6 +14,12 @@ import ttnn
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+
+
+class TracerInputLeaf(ABC):
+    @abstractmethod
+    def freeze(self) -> None:
+        """Freeze the input leaf to make it immutable for tracing."""
 
 
 class Tracer:
@@ -77,8 +84,8 @@ class Tracer:
 
             args = _tree_map(_verify_value, args, path_label="args")
             kwargs = _tree_map(_verify_value, kwargs, path_label="kwargs")
-            self._args = _tree_map(self._move_to_device_if_tensor, args, path_label="args")
-            self._kwargs = _tree_map(self._move_to_device_if_tensor, kwargs, path_label="kwargs")
+            self._args = _tree_map(self._prepare_input, args, path_label="args")
+            self._kwargs = _tree_map(self._prepare_input, kwargs, path_label="kwargs")
 
             # prepare trace capture - running twice before capturing is necessary for some models
             self._function(*self._args, **self._kwargs)
@@ -135,7 +142,11 @@ class Tracer:
             self._outputs = None
             ttnn.release_trace(self._device, trace_id)
 
-    def _move_to_device_if_tensor(self, value: Any, *, path_label: str) -> Any:
+    def _prepare_input(self, value: Any, *, path_label: str) -> Any:
+        if isinstance(value, TracerInputLeaf):
+            value.freeze()
+            return value
+
         if not isinstance(value, ttnn.Tensor):
             return value
 
@@ -176,7 +187,7 @@ class Tracer:
 
 
 def _verify_value(value: Any, *, path_label: str) -> Any:
-    if not isinstance(value, (ttnn.Tensor, int, float, str, bool, NoneType)):
+    if not isinstance(value, (ttnn.Tensor, int, float, str, bool, NoneType, TracerInputLeaf)):
         msg = f"value '{path_label}' has unsupported type {type(value)}"
         raise TypeError(msg)
 

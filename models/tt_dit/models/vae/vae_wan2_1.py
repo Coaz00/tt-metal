@@ -19,6 +19,7 @@ from ...parallel.manager import CCLManager
 from ...utils.conv3d import _ntuple, aligned_channels, get_conv3d_config, prepare_conv3d_weights
 from ...utils.substate import pop_substate, rename_substate
 from ...utils.tensor import bf16_tensor
+from ...utils.tracing import TracerInputLeaf
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Sequence
@@ -1435,9 +1436,13 @@ def get_neighbor_pad_num_links(ccl_manager, input_tensor, dim):
     return min(upper_dims, ccl_manager.num_links)
 
 
-class FeatureCache:
+class FeatureCache(TracerInputLeaf):
     def __init__(self) -> None:
         self._tensors: dict[str, ttnn.Tensor] = {}
+        self._frozen = False
+
+    def freeze(self) -> None:
+        self._frozen = True
 
     def get(self, key: str) -> ttnn.Tensor | None:
         return self._tensors.get(key)
