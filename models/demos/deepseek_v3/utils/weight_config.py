@@ -153,12 +153,8 @@ def get_weight_config(
     if mesh_device is None:
         raise ValueError("mesh_device must be provided")
 
-    weight_cache_path = (
-        weight_cache_path
-        / f"{hf_config.num_hidden_layers}_layers"
-        / f"mesh_{mesh_device.shape[0]}x{mesh_device.shape[1]}"
-    )
-    config_path = weight_cache_path / "config.json"
+    weight_cache_path = weight_cache_path / f"mesh_{mesh_device.shape[0]}x{mesh_device.shape[1]}"
+    config_path = weight_cache_path / f"config_{hf_config.num_hidden_layers}_layers.json"
 
     # Try to load from cache
     cached_config = _try_load_cached_config(config_path, weight_cache_path, force_recalculate)

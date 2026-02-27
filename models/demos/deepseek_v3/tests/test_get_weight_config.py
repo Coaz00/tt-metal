@@ -184,10 +184,8 @@ def test_get_weight_config_cache_invalidation_missing_weight_file(tmp_path: Path
     # Delete the weight file but keep config.json
     # config.json has relative paths, so we should resolve them relative to weight_cache_path
     # This simulates what validate_weight_config_paths does
-    weight_cache_path = (
-        base_cache / f"{hf_config.num_hidden_layers}_layers" / f"mesh_{mesh_device.shape[0]}x{mesh_device.shape[1]}"
-    )
-    config_path = weight_cache_path / "config.json"
+    weight_cache_path = base_cache / f"mesh_{mesh_device.shape[0]}x{mesh_device.shape[1]}"
+    config_path = weight_cache_path / f"config_{hf_config.num_hidden_layers}_layers.json"
 
     # Read the config.json to get the relative path (as it's actually stored)
     with config_path.open() as f:
@@ -244,10 +242,8 @@ def test_get_weight_config_cache_invalidation_wrong_suffix(tmp_path: Path) -> No
 
     # Corrupt config.json to have wrong suffix
     # Create a SavedWeight with wrong suffix - this will fail validation
-    weight_cache_path = (
-        base_cache / f"{hf_config.num_hidden_layers}_layers" / f"mesh_{mesh_device.shape[0]}x{mesh_device.shape[1]}"
-    )
-    config_path = weight_cache_path / "config.json"
+    weight_cache_path = base_cache / f"mesh_{mesh_device.shape[0]}x{mesh_device.shape[1]}"
+    config_path = weight_cache_path / f"config_{hf_config.num_hidden_layers}_layers.json"
     bad_weight = SavedWeight(path=Path("weights/w.bad"), memory_config=ttnn.DRAM_MEMORY_CONFIG)
     bad_config = {"w": bad_weight}
     with config_path.open("w") as f:
@@ -272,7 +268,7 @@ def test_get_weight_config_path_construction(tmp_path: Path) -> None:
         @staticmethod
         def convert_weights(hf_config, state_dicts, weight_cache_path: Path, mesh_device):
             # Verify the path structure
-            expected_suffix = f"{hf_config.num_hidden_layers}_layers/mesh_{mesh_device.shape[0]}x{mesh_device.shape[1]}"
+            expected_suffix = f"mesh_{mesh_device.shape[0]}x{mesh_device.shape[1]}"
             assert str(weight_cache_path).endswith(expected_suffix)
             (weight_cache_path / "weights").mkdir(parents=True, exist_ok=True)
             rel_path = Path("weights") / f"w{TENSOR_CACHE_EXTENSION}"
@@ -550,10 +546,8 @@ def test_get_weight_config_returns_normalized_paths(tmp_path: Path) -> None:
     assert cfg["w"].path.is_absolute()
 
     # But config.json should have relative paths (check by reading it)
-    weight_cache_path = (
-        base_cache / f"{hf_config.num_hidden_layers}_layers" / f"mesh_{mesh_device.shape[0]}x{mesh_device.shape[1]}"
-    )
-    config_path = weight_cache_path / "config.json"
+    weight_cache_path = base_cache / f"mesh_{mesh_device.shape[0]}x{mesh_device.shape[1]}"
+    config_path = weight_cache_path / f"config_{hf_config.num_hidden_layers}_layers.json"
     with config_path.open() as f:
         saved_config = json.load(f)
     # The saved path should be relative (as a string)

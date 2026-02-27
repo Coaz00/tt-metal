@@ -630,6 +630,26 @@ def _memory_config_to_dict(memory_config: ttnn.MemoryConfig | None) -> dict[str,
         }
 
 
+def _to_relative_path(path: Path) -> Path:
+    """Convert an absolute cache path to a path relative to the mesh_NxM directory."""
+    if not path.is_absolute():
+        return path
+    path_str = str(path)
+    mesh_idx = path_str.find("mesh_")
+    if mesh_idx == -1:
+        raise ValueError(f"Expected 'mesh_' in path: {path}")
+    parts = path_str[mesh_idx:].split("/", 1)
+    if len(parts) < 2:
+        raise ValueError(f"Invalid path structure after 'mesh_': {path}")
+    return Path(parts[1])
+
+
+def _tag_path_with_dtype(path: Path, dtype_name: str) -> Path:
+    """Insert dtype name before the .tensorbin extension."""
+    stem = path.name[: -len(TENSOR_CACHE_EXTENSION)]  # strip .tensorbin
+    return path.with_name(f"{stem}.{dtype_name}{TENSOR_CACHE_EXTENSION}")
+
+
 def _get_relative_cache_path(path: Path) -> str | None:
     """Extract the relative cache path from an absolute path."""
     if not path.is_absolute():
@@ -730,6 +750,17 @@ def shard_and_save(
                 not remove_dim or tensor.shape[shard_dim] == mesh_dim
             ), f"The removed dim {shard_dim} must be fully sharded"
 
+    if not path.name.endswith(TENSOR_CACHE_EXTENSION):
+        path = path.with_name(f"{path.name}{TENSOR_CACHE_EXTENSION}")
+
+    # Fast path: if dtype is known upfront and the file already exists, skip computation
+    if dtype is not None:
+        candidate_path = _tag_path_with_dtype(path, dtype.name)
+        candidate_path.parent.mkdir(parents=True, exist_ok=True)
+        if candidate_path.exists():
+            logger.info(f"Reusing existing cached weight: {candidate_path}")
+            return SavedWeight(_to_relative_path(candidate_path), memory_config, dtype)
+
     if _torch_impl:
         ttnn_tensor = _shard_torch_impl(
             path=path,
@@ -753,18 +784,15 @@ def shard_and_save(
             memory_config=memory_config,
         )
 
-    if not path.name.endswith(TENSOR_CACHE_EXTENSION):
-        path = path.with_name(f"{path.name}{TENSOR_CACHE_EXTENSION}")
-
-    path.parent.mkdir(parents=True, exist_ok=True)
-
-    if path.exists():
-        logger.warning(f"Overwriting existing cache file: {path}")
+    final_path = _tag_path_with_dtype(path, ttnn_tensor.dtype.name)
+    final_path.parent.mkdir(parents=True, exist_ok=True)
+    if final_path.exists():
+        logger.warning(f"Overwriting existing cache file: {final_path}")
     record = {
         "event": "deepseek_v3.cache_tensor_spec",
         "pid": os.getpid(),
-        "cache_file_path": str(path),
-        "cache_file_relpath": _get_relative_cache_path(path),
+        "cache_file_path": str(final_path),
+        "cache_file_relpath": _get_relative_cache_path(final_path),
         "torch_shape": list(tensor.shape),
         "torch_dtype": str(tensor.dtype),
         "requested_dtype": _enum_name_or_str(dtype),
@@ -784,7 +812,7 @@ def shard_and_save(
         "result_memory_config": _memory_config_to_dict(ttnn_tensor.memory_config()),
     }
     try:
-        ttnn.dump_tensor(path, ttnn_tensor)
+        ttnn.dump_tensor(final_path, ttnn_tensor)
     except Exception as e:
         record["status"] = f"error({type(e).__name__}: {e})"
         _append_cache_specs_record(record)
@@ -792,20 +820,7 @@ def shard_and_save(
     else:
         _append_cache_specs_record(record)
 
-    # Always convert absolute paths to relative paths for portability
-    # This ensures SavedWeight objects always have relative paths
-    if path.is_absolute():
-        path_str = str(path)
-        mesh_idx = path_str.find("mesh_")
-        if mesh_idx == -1:
-            raise ValueError(f"Expected 'mesh_' in path: {path}")
-        # Skip past "mesh_<rows>x<cols>/" to get relative path
-        parts = path_str[mesh_idx:].split("/", 1)
-        if len(parts) < 2:
-            raise ValueError(f"Invalid path structure after 'mesh_': {path}")
-        path = Path(parts[1])
-
-    return SavedWeight(path, memory_config, ttnn_tensor.dtype)
+    return SavedWeight(_to_relative_path(final_path), memory_config, ttnn_tensor.dtype)
 
 
 def _shard_device_impl(

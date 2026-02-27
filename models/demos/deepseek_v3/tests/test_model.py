@@ -551,7 +551,7 @@ def test_forward_pass(
     set_deterministic_env,
     state_dict,
 ):
-    hf_config_short.num_hidden_layers = 5
+    hf_config_short.num_hidden_layers = 6
 
     if mode != "decode":
         decode_position_ids = None
