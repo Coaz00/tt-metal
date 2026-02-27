@@ -356,7 +356,7 @@ ttnn::Tensor prepare_conv_transpose2d_weights(
         kernel_size,
         stride,
         padding_n4,
-        {0, 0},
+        {0, 0},  // output_padding assumed to be 0 for weight preparation
         dilation,
         groups,
         input_layout,

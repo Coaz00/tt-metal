@@ -865,14 +865,7 @@ Result conv_transpose2d_DRAM(
                     tt::tt_metal::PageConfig(Layout::ROW_MAJOR),
                     MemoryConfig{TensorMemoryLayout::INTERLEAVED, BufferType::DRAM})),
             device);
-        auto temp_output = create_device_tensor(
-            TensorSpec(
-                ttnn::Shape({batch_size, dims.output_height, dims.output_width, out_channels}),
-                tt::tt_metal::TensorLayout(
-                    output_dtype,
-                    tt::tt_metal::PageConfig(conv_config.output_layout),
-                    MemoryConfig{TensorMemoryLayout::INTERLEAVED, BufferType::DRAM})),
-            device);
+        auto output_shape = ttnn::Shape({batch_size, dims.output_height, dims.output_width, out_channels});
 
         auto temp_slice_attr =
             std::unique_ptr<ttnn::operations::op_slicing::OpSliceAttr>(get_conv_transpose2d_slice_attr(
@@ -900,7 +893,7 @@ Result conv_transpose2d_DRAM(
         effective_slice_config = ttnn::operations::op_slicing::determine_slice_config(
             temp_slice_attr.get(),
             temp_input.logical_shape(),
-            temp_output.logical_shape(),
+            output_shape,
             dram_slice_config_,
             conv_config.output_layout,
             device);
@@ -909,7 +902,6 @@ Result conv_transpose2d_DRAM(
 
         // Clean up temporary tensors
         temp_input.deallocate();
-        temp_output.deallocate();
 
         // If auto-determination results in num_slices==1, convert to L1_FULL
         // This signals that the operation fits entirely in L1 and should use the L1 path
