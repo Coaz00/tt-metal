@@ -663,7 +663,11 @@ void JitBuildState::build(const JitBuildSettings* settings, std::span<const JitB
     for (const auto* target : link_targets) {
         string target_out_dir = fmt::format("{}{}{}/", target->out_path_, kernel_name, target->target_name_);
         fs::create_directories(target_out_dir);
-        if (compiled.any() || target->need_link(target_out_dir)) {
+        bool need_rebuild = compiled.any() || target->need_link(target_out_dir);
+        if (!need_rebuild && target->is_fw_ && !fs::exists(target->weakened_firmware_name_)) {
+            need_rebuild = true;
+        }
+        if (need_rebuild) {
             populate_link_objs();
             target->link(target_out_dir, settings, link_objs);
             if (target->is_fw_) {
