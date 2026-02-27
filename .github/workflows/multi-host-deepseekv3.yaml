@@ -122,12 +122,21 @@ jobs:
         run: |
           CACHE_BASE="/mnt/MLPerf/tt_dnn-models/deepseek-ai/DeepSeek-R1-0528-Cache"
           if [[ "${{ inputs.recalculate_weights_cache }}" == "Yes" && -n "${{ inputs.new_cache_dir }}" ]]; then
-            CLEAN_NAME=$(echo "${{ inputs.new_cache_dir }}" | sed 's|/||g')
-            if [[ "${CLEAN_NAME}" == "CI" ]]; then
+            DIR_NAME="${{ inputs.new_cache_dir }}"
+            if [[ "${DIR_NAME}" =~ [/[:space:][:cntrl:]] || "${DIR_NAME}" == "." || "${DIR_NAME}" == ".." ]]; then
+              echo "::error::new_cache_dir contains invalid characters (slashes, spaces, control chars) or is '.'/'..'"
+              exit 1
+            fi
+            if [[ "${DIR_NAME}" == "CI" ]]; then
               echo "::error::new_cache_dir cannot be 'CI' — this would overwrite the production cache."
               exit 1
             fi
-            NEW_DIR="${CACHE_BASE}/${CLEAN_NAME}"
+            NEW_DIR="${CACHE_BASE}/${DIR_NAME}"
+            RESOLVED=$(realpath -m "${NEW_DIR}")
+            if [[ "${RESOLVED}" != "${CACHE_BASE}/"* || "${RESOLVED}" == "${CACHE_BASE}/CI" ]]; then
+              echo "::error::new_cache_dir resolves outside the allowed cache base or to the CI directory."
+              exit 1
+            fi
             echo "Creating new cache directory: ${NEW_DIR}"
             mkdir -p "${NEW_DIR}"
             echo "Copying test_io_cache from CI directory..."
