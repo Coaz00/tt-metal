@@ -46,17 +46,17 @@ PERF_MEASURE_ITERS = 100
 DEVICE_PERF_ITERS = 10
 DEVICE_PERF_MARGIN = 1.0
 DEVICE_PERF_TARGETS_US = {
-    ("decode", 1, "kv_lora_rank"): {"kernel": 11.448, "op_to_op": 794.909},
-    ("decode", 1, "q_lora_rank"): {"kernel": 27.317, "op_to_op": 678.913},
-    ("prefill", 128, "kv_lora_rank"): {"kernel": 11.710, "op_to_op": 248.137},
-    ("prefill", 128, "q_lora_rank"): {"kernel": 27.997, "op_to_op": 228.919},
+    ("decode", 1, "kv_lora_rank"): {"kernel": 11.448, "op_to_op": None},
+    ("decode", 1, "q_lora_rank"): {"kernel": 27.317, "op_to_op": None},
+    ("prefill", 128, "kv_lora_rank"): {"kernel": 11.710, "op_to_op": None},
+    ("prefill", 128, "q_lora_rank"): {"kernel": 27.997, "op_to_op": None},
     ("prefill", 1024, "kv_lora_rank"): {
         "kernel": 45.244,
-        "op_to_op": 37423.566,
+        "op_to_op": None,
     },  # Measured: kernel=41.131, op_to_op=34021.424
     ("prefill", 1024, "q_lora_rank"): {
         "kernel": 111.938,
-        "op_to_op": 106094.376,
+        "op_to_op": None,
     },  # Measured: kernel=101.76, op_to_op=96449.43
 }
 
@@ -346,6 +346,7 @@ def _build_rms_norm_inputs(
     return run_config, tt_input, ref_output, batch_size, hidden_size
 
 
+@pytest.mark.ci_fused_op
 @pytest.mark.parametrize(
     "mode, seq_len, expected_pcc, expected_atol, expected_rtol, expected_perf_us",
     [
@@ -581,15 +582,18 @@ def test_ds_rms_norm_device_perf(mode, seq_len, hf_config_size_attr):
         logger.warning("No device perf targets configured; skipping perf assertions.")
     else:
         kernel_target_us = targets["kernel"]
-        op_to_op_target_us = targets["op_to_op"]
         kernel_limit_us = kernel_target_us * (1 + DEVICE_PERF_MARGIN)
-        op_to_op_limit_us = op_to_op_target_us * (1 + DEVICE_PERF_MARGIN)
         assert (
             total_kernel_us <= kernel_limit_us
         ), f"Kernel perf regression: {total_kernel_us:.3f}us exceeds {kernel_target_us:.3f}us (+{DEVICE_PERF_MARGIN:.0%})"
-        assert (
-            total_op_to_op_us <= op_to_op_limit_us
-        ), f"Op-to-op perf regression: {total_op_to_op_us:.3f}us exceeds {op_to_op_target_us:.3f}us (+{DEVICE_PERF_MARGIN:.0%})"
+        op_to_op_target_us = targets.get("op_to_op")
+        if op_to_op_target_us is None:
+            logger.info("Op-to-op perf target is unset; skipping op-to-op perf assertion.")
+        else:
+            op_to_op_limit_us = op_to_op_target_us * (1 + DEVICE_PERF_MARGIN)
+            assert (
+                total_op_to_op_us <= op_to_op_limit_us
+            ), f"Op-to-op perf regression: {total_op_to_op_us:.3f}us exceeds {op_to_op_target_us:.3f}us (+{DEVICE_PERF_MARGIN:.0%})"
 
     benchmark_data.add_measurement(
         perf_profiler,

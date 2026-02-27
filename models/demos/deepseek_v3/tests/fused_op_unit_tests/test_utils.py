@@ -10,7 +10,10 @@ to reduce code duplication and ensure consistent behavior.
 
 import math
 import os
+import re
+import shlex
 from collections import defaultdict
+from pathlib import Path
 from typing import Callable
 
 import pandas as pd
@@ -20,7 +23,108 @@ from loguru import logger
 
 import ttnn
 from models.common.utility_functions import comp_pcc, profiler
-from tools.tracy.process_model_log import get_latest_ops_log_filename, get_profiler_folder
+from tools.tracy.process_model_log import get_profiler_folder
+
+TIMESTAMP_DIR_RE = re.compile(r"^\d{4}_\d{2}_\d{2}_\d{2}_\d{2}_\d{2}$")
+
+
+def _get_latest_timestamped_ops_report(subdir: str) -> tuple[Path, str]:
+    """Return latest Tracy ops report from timestamped report directories only."""
+    profiler_dir = Path(get_profiler_folder(subdir))
+    reports_dir = profiler_dir / "reports"
+    if not reports_dir.exists():
+        raise FileNotFoundError(f"Profiler reports directory not found: {reports_dir}")
+
+    run_dirs = sorted(
+        [p for p in reports_dir.iterdir() if p.is_dir() and TIMESTAMP_DIR_RE.match(p.name)],
+        key=lambda p: p.name,
+    )
+    if not run_dirs:
+        raise FileNotFoundError(f"No timestamped profiler report directories found in: {reports_dir}")
+
+    latest_dir = run_dirs[-1]
+    expected_name = latest_dir / f"ops_perf_results_{latest_dir.name}.csv"
+    if expected_name.exists():
+        return expected_name, latest_dir.name
+
+    # Defensive fallback in case Tracy changes exact filename pattern.
+    matches = sorted(latest_dir.glob("ops_perf_results_*.csv"))
+    if not matches:
+        raise FileNotFoundError(f"No ops_perf_results_*.csv found in latest report directory: {latest_dir}")
+    return matches[-1], latest_dir.name
+
+
+def _build_report_tag_from_command(command: str) -> str:
+    """Create a stable per-test tag from pytest command and -k expression."""
+    normalized_command = command.strip()
+    if (
+        len(normalized_command) >= 2
+        and normalized_command[0] == normalized_command[-1]
+        and normalized_command[0] in {"'", '"'}
+    ):
+        normalized_command = normalized_command[1:-1]
+
+    try:
+        tokens = shlex.split(normalized_command)
+    except ValueError:
+        tokens = normalized_command.split()
+
+    test_spec = next((t for t in tokens if "::" in t and t.endswith(".py") is False), None)
+    if test_spec is None:
+        # Try recovering from separate path + ::test style
+        for i, token in enumerate(tokens[:-1]):
+            if token.endswith(".py") and tokens[i + 1].startswith("::"):
+                test_spec = f"{token}{tokens[i + 1]}"
+                break
+
+    op_part = "unknown_test"
+    if test_spec:
+        test_path = test_spec.split("::")[0]
+        op_part = Path(test_path).stem
+
+    expr = ""
+    if "-k" in tokens:
+        k_idx = tokens.index("-k")
+        if k_idx + 1 < len(tokens):
+            expr = tokens[k_idx + 1]
+
+    expr_tokens = [t.strip() for t in re.split(r"\s+", expr) if t.strip()]
+    mode = "decode" if "decode" in expr_tokens else ("prefill" if "prefill" in expr_tokens else "mode")
+    runtime = "trace" if "trace" in expr_tokens else ("eager" if "eager" in expr_tokens else "runtime")
+    seq = next((t for t in expr_tokens if t.isdigit()), "seq")
+    program_cache = "pcache" if "program_cache" in expr_tokens else "nopcache"
+
+    extras = []
+    for token in expr_tokens:
+        if token in {"and", "or", "not", "decode", "prefill", "trace", "eager", "program_cache", "no_program_cache"}:
+            continue
+        if token.isdigit():
+            continue
+        extras.append(token)
+    extras = extras[:3]
+
+    parts = [op_part, f"{mode}_seq{seq}", runtime, program_cache]
+    if extras:
+        parts.extend(extras)
+
+    tag = "__".join(parts)
+    # Keep the directory/file names portable.
+    tag = re.sub(r"[^a-zA-Z0-9_.-]+", "_", tag).strip("._-")
+    return tag or "unknown_test"
+
+
+def _copy_ops_report_to_test_folder(subdir: str, report_tag: str, ops_report_path: Path, run_timestamp: str) -> None:
+    """Copy ops report to reports/<test-tag>/<timestamp>_ops_perf_results_*.csv."""
+    import shutil
+
+    profiler_dir = Path(get_profiler_folder(subdir))
+    destination_dir = profiler_dir / "reports" / report_tag
+    destination_dir.mkdir(parents=True, exist_ok=True)
+
+    destination_name = f"{run_timestamp}_{ops_report_path.name}"
+    destination_path = destination_dir / destination_name
+    shutil.copy2(ops_report_path, destination_path)
+    logger.info(f"Saved test-specific ops report copy: {destination_path}")
 
 
 def get_int_env(name: str, default: int) -> int:
@@ -450,7 +554,8 @@ def collect_device_perf(
     # We intentionally do not accept .logs/cpp_device_perf_report.csv as the source
     # for fused-op perf targets.
     try:
-        ops_filename = get_latest_ops_log_filename(subdir)
+        # Use timestamped-run lookup so reports/<test-name>/ folders don't break discovery.
+        ops_filename, run_timestamp = _get_latest_timestamped_ops_report(subdir)
     except FileNotFoundError as e:
         raise RuntimeError(
             "Required Tracy ops report directory was not generated. "
@@ -465,6 +570,8 @@ def collect_device_perf(
 
     logger.info(f"Using post-processed ops report: {ops_filename}")
     ops_df = pd.read_csv(ops_filename)
+    report_tag = _build_report_tag_from_command(command)
+    _copy_ops_report_to_test_folder(subdir, report_tag, ops_filename, run_timestamp)
 
     required_ops_cols = ["OP TYPE", "OP CODE", "DEVICE KERNEL DURATION [ns]", "OP TO OP LATENCY [ns]"]
     missing_ops_cols = [col for col in required_ops_cols if col not in ops_df.columns]
