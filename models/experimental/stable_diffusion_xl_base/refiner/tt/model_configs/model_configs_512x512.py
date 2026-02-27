@@ -60,6 +60,18 @@ class RefinerModelOptimisations512x512(RefinerModelOptimisationsBase, ModelOptim
             act_block_h_override=32,
         )
 
+        self.conv_configs["ABH_32_ADB_WDB_NO_MOVE_BS"] = ttnn.Conv2dConfig(
+            weights_dtype=self.conv_ws_dtype,
+            shard_layout=ttnn.TensorMemoryLayout.BLOCK_SHARDED,
+            deallocate_activation=False,
+            reallocate_halo_output=False,
+            enable_act_double_buffer=True,
+            enable_weights_double_buffer=True,
+            reshard_if_not_optimal=True,
+            act_block_w_div=1,
+            act_block_h_override=32,
+        )
+
         self.conv_configs["ABH_128_ADB_WDB_NO_MOVE_BS"] = ttnn.Conv2dConfig(
             weights_dtype=self.conv_ws_dtype,
             shard_layout=ttnn.TensorMemoryLayout.BLOCK_SHARDED,
@@ -424,7 +436,7 @@ class RefinerModelOptimisations512x512(RefinerModelOptimisationsBase, ModelOptim
                 "2D_RESNET_CONV_384_768": ttnn.MatmulMultiCoreReuseMultiCastProgramConfig(
                     compute_with_storage_grid_size=(5, 8),
                     in0_block_w=3,
-                    per_core_M=16,
+                    per_core_M=4,
                     per_core_N=5,
                     out_subblock_h=1,
                     out_subblock_w=5,
@@ -434,7 +446,7 @@ class RefinerModelOptimisations512x512(RefinerModelOptimisationsBase, ModelOptim
                 "2D_RESNET_CONV_768_1536": ttnn.MatmulMultiCoreReuseMultiCastProgramConfig(
                     compute_with_storage_grid_size=(5, 8),
                     in0_block_w=6,
-                    per_core_M=4,
+                    per_core_M=1,
                     per_core_N=10,
                     out_subblock_h=1,
                     out_subblock_w=5,
@@ -442,19 +454,19 @@ class RefinerModelOptimisations512x512(RefinerModelOptimisationsBase, ModelOptim
                     fused_activation=None,
                 ),
                 "2D_RESNET_CONV_3072_1536": ttnn.MatmulMultiCoreReuseMultiCastProgramConfig(
-                    compute_with_storage_grid_size=(5, 8),
+                    compute_with_storage_grid_size=(8, 2),
                     in0_block_w=12,
                     per_core_M=1,
-                    per_core_N=10,
+                    per_core_N=6,
                     out_subblock_h=1,
                     out_subblock_w=2,
                     transpose_mcast=False,
                     fused_activation=None,
                 ),
-                "2D_RESNET_CONV_3072_1536_1024": ttnn.MatmulMultiCoreReuseMultiCastProgramConfig(
+                "2D_RESNET_CONV_3072_1536_256": ttnn.MatmulMultiCoreReuseMultiCastProgramConfig(
                     compute_with_storage_grid_size=(5, 8),
                     in0_block_w=8,
-                    per_core_M=4,
+                    per_core_M=1,
                     per_core_N=10,
                     out_subblock_h=1,
                     out_subblock_w=5,
@@ -464,7 +476,7 @@ class RefinerModelOptimisations512x512(RefinerModelOptimisationsBase, ModelOptim
                 "2D_RESNET_CONV_2304_768": ttnn.MatmulMultiCoreReuseMultiCastProgramConfig(
                     compute_with_storage_grid_size=(5, 8),
                     in0_block_w=6,
-                    per_core_M=16,
+                    per_core_M=4,
                     per_core_N=5,
                     out_subblock_h=1,
                     out_subblock_w=5,
@@ -474,7 +486,7 @@ class RefinerModelOptimisations512x512(RefinerModelOptimisationsBase, ModelOptim
                 "2D_RESNET_CONV_1536_768": ttnn.MatmulMultiCoreReuseMultiCastProgramConfig(
                     compute_with_storage_grid_size=(5, 8),
                     in0_block_w=6,
-                    per_core_M=16,
+                    per_core_M=4,
                     per_core_N=5,
                     out_subblock_h=1,
                     out_subblock_w=5,
@@ -484,7 +496,7 @@ class RefinerModelOptimisations512x512(RefinerModelOptimisationsBase, ModelOptim
                 "2D_RESNET_CONV_1152_768": ttnn.MatmulMultiCoreReuseMultiCastProgramConfig(
                     compute_with_storage_grid_size=(5, 8),
                     in0_block_w=6,
-                    per_core_M=16,
+                    per_core_M=4,
                     per_core_N=5,
                     out_subblock_h=1,
                     out_subblock_w=5,
@@ -494,7 +506,7 @@ class RefinerModelOptimisations512x512(RefinerModelOptimisationsBase, ModelOptim
                 "1D_RESNET_CONV_1152_384": ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig(
                     compute_with_storage_grid_size=(5, 8),
                     in0_block_w=3,
-                    per_core_M=13,
+                    per_core_M=4,
                     per_core_N=12,
                     out_subblock_h=1,
                     out_subblock_w=6,
@@ -505,7 +517,7 @@ class RefinerModelOptimisations512x512(RefinerModelOptimisationsBase, ModelOptim
                 "1D_RESNET_CONV_768_384": ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig(
                     compute_with_storage_grid_size=(5, 8),
                     in0_block_w=3,
-                    per_core_M=13,
+                    per_core_M=4,
                     per_core_N=12,
                     out_subblock_h=1,
                     out_subblock_w=6,
@@ -615,6 +627,18 @@ class RefinerModelOptimisations512x512(RefinerModelOptimisationsBase, ModelOptim
             legacy_rsqrt=True,
         )
 
+        # region GROUPNORM CONFIGS
+        self.groupnorm_configs["DRAM_GROUPNORM_2X8"] = {
+            "op_config": {
+                "core_grid": ttnn.CoreGrid(y=2, x=8),
+                "num_out_blocks": 1,
+                "inplace": False,
+            },
+            "memory_config": ttnn.DRAM_MEMORY_CONFIG,
+            "negative_mask": False,
+        }
+        # endregion
+
     def get_matmul_config(self, matmul_path):
         if matmul_path is None:
             return None
@@ -714,7 +738,7 @@ class RefinerModelOptimisations512x512(RefinerModelOptimisationsBase, ModelOptim
                 or "up_blocks.1.resnets.1" in matmul_path
                 or "up_blocks.1.resnets.2" in matmul_path
             ):
-                return self.matmul_configs.get("2D_RESNET_CONV_3072_1536_1024")
+                return self.matmul_configs.get("2D_RESNET_CONV_3072_1536_256")
             if "up_blocks.2.resnets.0" in matmul_path:
                 return self.matmul_configs.get("2D_RESNET_CONV_2304_768")
             if "up_blocks.2.resnets.1" in matmul_path:
@@ -804,17 +828,17 @@ class RefinerModelOptimisations512x512(RefinerModelOptimisationsBase, ModelOptim
             return self.conv_configs["ABH_512_ADB_WDB_BS"]
         if "down_blocks.1" in conv_path:
             if "resnets.0" in conv_path and "conv1" in conv_path:
-                return self.conv_configs["ABH_256_ADB_WDB_BS_NO_MOVE"]
-            else:
-                return self.conv_configs["ABH_256_ADB_WDB_BS"]
-        if "down_blocks.2" in conv_path:
-            if "resnets.0" in conv_path and "conv1" in conv_path:
                 return self.conv_configs["ABH_128_ADB_WDB_NO_MOVE_BS"]
             else:
                 return self.conv_configs["ABH_128_ADB_WDB_BS"]
+        if "down_blocks.2" in conv_path:
+            if "resnets.0" in conv_path and "conv1" in conv_path:
+                return self.conv_configs["ABH_32_ADB_WDB_NO_MOVE_BS"]
+            else:
+                return self.conv_configs["ABH_32_ADB_WDB_BS"]
         if "down_blocks.3" in conv_path or "mid_block" in conv_path:
             if "conv1" in conv_path:
-                return self.conv_configs["ABH_64_ADB_WDB_BS"]
+                return self.conv_configs["ABH_32_ADB_WDB_BS"]
             else:
                 return self.conv_configs["ABH_32_ADB_WDB_BS"]
         if "upsamplers" in conv_path:
@@ -831,28 +855,17 @@ class RefinerModelOptimisations512x512(RefinerModelOptimisationsBase, ModelOptim
                 return self.conv_configs["ABH_32_ADB_WDB_BS"]
         if "up_blocks.1" in conv_path:
             if "conv1" in conv_path:
-                if "resnets.2" in conv_path:
-                    return self.conv_configs["ABH_128_ADB_WDB_BS"]
-                else:
-                    return self.conv_configs["ABH_128_NO_ADB_WDB_BS"]
+                return self.conv_configs["ABH_32_ADB_WDB_BS"]
             else:
-                return self.conv_configs["ABH_128_ADB_WDB_BS"]
+                return self.conv_configs["ABH_32_ADB_WDB_BS"]
         if "up_blocks.2" in conv_path:
             if "conv1" in conv_path:
-                if "resnets.0" in conv_path:
-                    return self.conv_configs["ABH_64_ADB_WDB_BS"]
-                elif "resnets.1" in conv_path:
-                    return self.conv_configs["ABH_128_ADB_WDB_BS"]
-                else:
-                    return self.conv_configs["ABH_256_ADB_WDB_BS"]
+                return self.conv_configs["ABH_128_ADB_WDB_BS"]
             else:
-                return self.conv_configs["ABH_256_ADB_WDB_BS"]
+                return self.conv_configs["ABH_128_ADB_WDB_BS"]
         if "up_blocks.3" in conv_path:
             if "conv1" in conv_path:
-                if "resnets.0" in conv_path:
-                    return self.conv_configs["ABH_64_ADB_WDB_BS"]
-                else:
-                    return self.conv_configs["ABH_256_ADB_WDB_BS"]
+                return self.conv_configs["ABH_256_ADB_WDB_BS"]
             else:
                 return self.conv_configs["ABH_512_ADB_WDB_BS"]
         if "conv_in" in conv_path:
@@ -868,11 +881,11 @@ class RefinerModelOptimisations512x512(RefinerModelOptimisationsBase, ModelOptim
         return self.conv_output_dtype
 
     def _get_groupnorm_config(self, module_path):
-        if "up_blocks.3" in module_path and "resnets.0" in module_path and "norm1" in module_path:
-            return self.groupnorm_configs["DRAM_GROUPNORM_4X8"]
         if "up_blocks.3" in module_path and "resnets.0" not in module_path and "norm1" in module_path:
             return self.groupnorm_configs["SHARDED_GROUPNORM_INPLACE_NEGATIVE"]
         if "resnets" in module_path:
+            if "down_blocks.3" in module_path or "mid_block" in module_path or "up_blocks.0" in module_path:
+                return self.groupnorm_configs["DRAM_GROUPNORM_2X8"]
             return self.groupnorm_configs["SHARDED_GROUPNORM_INPLACE"]
         if "attentions" in module_path:
             return self.groupnorm_configs["SHARDED_GROUPNORM_NON_INPLACE"]
