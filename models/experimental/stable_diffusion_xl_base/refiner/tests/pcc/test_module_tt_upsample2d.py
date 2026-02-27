@@ -41,18 +41,23 @@ def test_upsample2d(
     dilation,
     debug_mode,
     is_ci_env,
+    is_ci_v2_env,
+    model_location_generator,
     reset_seeds,
 ):
     # Skip unsupported image resolutions
     if image_resolution != (1024, 1024):
         pytest.skip(f"Unsupported image resolution: {image_resolution}. Only (1024, 1024) is supported.")
 
+    model_location = model_location_generator(
+        "stable-diffusion-xl-refiner-1.0/unet", download_if_ci_v2=True, ci_v2_timeout_in_s=1800
+    )
     unet = UNet2DConditionModel.from_pretrained(
-        "stabilityai/stable-diffusion-xl-refiner-1.0",
+        "stabilityai/stable-diffusion-xl-refiner-1.0" if not is_ci_v2_env else model_location,
         torch_dtype=torch.float32,
         use_safetensors=True,
-        subfolder="unet",
-        local_files_only=is_ci_env,
+        local_files_only=is_ci_env or is_ci_v2_env,
+        subfolder="unet" if not is_ci_v2_env else None,
     )
     unet.eval()
     state_dict = unet.state_dict()
