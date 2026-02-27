@@ -330,11 +330,7 @@ class WanCausalConv3d(Module):
             x_BTHWC = ttnn.concat([cache_x_BTHWC, x_BTHWC], dim=1)
             t_front_padding -= cache_x_BTHWC.shape[1]
         if t_front_padding > 0:
-            # Padding only works on the lowest 3 dims. reshape input.
-            B, T, H, W, C = x_BTHWC.shape
-            x_BTNC = ttnn.reshape(x_BTHWC, (B, T, H * W, C))
-            x_BTNC = ttnn.pad(x_BTNC, [(0, 0), (t_front_padding, 0), (0, 0), (0, 0)], value=0.0)
-            x_BTHWC = ttnn.reshape(x_BTNC, (B, T + t_front_padding, H, W, C))
+            x_BTHWC = tensor.pad_single(x_BTHWC, dim=1, front=t_front_padding, value=0.0)
 
         if logical_h % self.parallel_config.height_parallel.factor != 0:
             """
