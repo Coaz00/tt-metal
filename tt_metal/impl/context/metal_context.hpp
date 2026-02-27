@@ -104,9 +104,6 @@ public:
         bool minimal = false);
     void teardown();
 
-    // Switch from mock mode to real hardware (requires all devices to be closed)
-    void reinitialize_for_real_hardware();
-
     // Set fast dispatch mode and automatically reinitialize dispatch managers
     // This ensures dispatch/compute core allocations stay in sync with the mode
     void set_fast_dispatch_mode(bool enable);
@@ -229,9 +226,6 @@ private:
     // Mutex to protect timeout detection for thread-safe access
     std::mutex dispatch_timeout_detection_mutex_;
     bool dispatch_timeout_detection_processed_ = false;
-
-    // Mutex to protect reinitialization operations (switching between mock and real hardware)
-    std::mutex reinitialization_mutex_;
 
     // Mutex to protect bank-to-NOC table generation (called concurrently during device initialization)
     mutable std::mutex bank_to_noc_tables_mutex_;
