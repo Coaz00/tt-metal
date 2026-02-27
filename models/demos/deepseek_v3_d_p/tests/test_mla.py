@@ -10,9 +10,10 @@ import pytest
 import torch
 from loguru import logger
 
+import ttnn
 from models.demos.deepseek_v3.reference.configuration_deepseek import DeepseekV3Config
 from models.demos.deepseek_v3_d_p.reference.mla_reference import create_mla_reference
-from models.demos.deepseek_v3_d_p.tt.mla import MLASimple
+from models.demos.deepseek_v3_d_p.tt.mla import ttMLA
 
 
 @pytest.fixture
@@ -79,8 +80,18 @@ def random_weights():
     ids=["4x2"],
     indirect=True,
 )
+@pytest.mark.parametrize(
+    "device_params",
+    [
+        {
+            "fabric_config": ttnn.FabricConfig.FABRIC_1D,
+        }
+    ],
+    indirect=True,
+)
 @pytest.mark.parametrize("use_pretrained", [False, True], ids=["random", "pretrained"])
-def test_mla(use_pretrained, random_weights, pretrained_weights, mesh_device):
+@pytest.mark.parametrize("seq_len", [1024], ids=["seq1024"])
+def test_mla(use_pretrained, random_weights, pretrained_weights, mesh_device, seq_len):
     """
     Test comparing reference and TT MLA modules with same weights.
 
@@ -140,7 +151,7 @@ def test_mla(use_pretrained, random_weights, pretrained_weights, mesh_device):
 
     # Create TT MLA
     logger.info("Creating TT MLA...")
-    mla_tt = MLASimple(config, weights, mesh_device, layer_idx=0)
+    mla_tt = ttMLA(config, weights, mesh_device, layer_idx=0)
 
     # Verify both exist
     assert mla_ref is not None, "Reference MLA should exist"
@@ -160,5 +171,88 @@ def test_mla(use_pretrained, random_weights, pretrained_weights, mesh_device):
         ref_key = f"attention.{key}"
         assert ref_key in ref_state_dict, f"Reference missing {ref_key}"
         assert key in tt_weight_shapes, f"TT missing {key}"
+
+    logger.info(f"✓ Weight loading verified")
+
+    # Test forward pass comparison
+    logger.info("=" * 80)
+    logger.info(f"Testing forward pass comparison (seq_len={seq_len})")
+    logger.info("=" * 80)
+
+    # Create test inputs
+    batch_size = 1
+    hidden_size = config.hidden_size
+
+    logger.info(f"Creating test inputs: batch_size={batch_size}, seq_len={seq_len}, hidden_size={hidden_size}")
+
+    # Create random input tensor
+    torch.manual_seed(42)
+    hidden_states = torch.randn(batch_size, seq_len, hidden_size, dtype=torch.bfloat16)
+
+    # Create causal attention mask
+    attention_mask = torch.triu(torch.ones(seq_len, seq_len, dtype=torch.bfloat16) * float("-inf"), diagonal=1)
+    attention_mask = attention_mask.unsqueeze(0).unsqueeze(0).expand(batch_size, 1, seq_len, seq_len)
+
+    # Create position IDs
+    position_ids = torch.arange(seq_len, dtype=torch.long).unsqueeze(0).expand(batch_size, seq_len)
+
+    # Run reference forward pass
+    logger.info("Running reference CPU forward pass...")
+    mla_ref = mla_ref.eval().to(torch.bfloat16)
+    with torch.no_grad():
+        ref_output, _, _ = mla_ref(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_value=None,
+            output_attentions=False,
+            use_cache=False,
+        )
+
+    logger.info(f"✓ Reference forward pass complete")
+    logger.info(f"  Input shape:  {hidden_states.shape}")
+    logger.info(f"  Output shape: {ref_output.shape}")
+    logger.info(f"  Output dtype: {ref_output.dtype}")
+    logger.info(f"  Output mean:  {ref_output.mean().item():.4f}")
+    logger.info(f"  Output std:   {ref_output.std().item():.4f}")
+
+    tt_hidden_states = ttnn.from_torch(
+        hidden_states.unsqueeze(0),
+        device=mesh_device,
+        dtype=ttnn.bfloat16,
+        memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        layout=ttnn.TILE_LAYOUT,
+        mesh_mapper=ttnn.ShardTensor2dMesh(mesh_device, mesh_shape=tuple(mesh_device.shape), dims=(-2, -1)),
+    )
+    tt_output = mla_tt.forward(
+        hidden_states=tt_hidden_states,
+        rope_tensors=None,
+    )
+    logger.warning("⚠️  TT forward pass not yet implemented - skipping comparison")
+
+    # TODO: Compare outputs
+    # logger.info("Comparing reference vs TT outputs...")
+    # if tt_output is not None:
+    #     # Convert TT output to CPU for comparison
+    #     tt_output_cpu = tt_output.cpu()  # or appropriate conversion
+    #
+    #     # Compute PCC (Pearson Correlation Coefficient)
+    #     pcc = torch.corrcoef(torch.stack([
+    #         ref_output.flatten(),
+    #         tt_output_cpu.flatten()
+    #     ]))[0, 1].item()
+    #
+    #     # Compute relative error
+    #     rel_error = torch.abs(ref_output - tt_output_cpu) / (torch.abs(ref_output) + 1e-6)
+    #     max_rel_error = rel_error.max().item()
+    #     mean_rel_error = rel_error.mean().item()
+    #
+    #     logger.info(f"  PCC: {pcc:.6f}")
+    #     logger.info(f"  Max relative error: {max_rel_error:.6f}")
+    #     logger.info(f"  Mean relative error: {mean_rel_error:.6f}")
+    #
+    #     # Assert PCC is high enough (e.g., > 0.99 for good match)
+    #     assert pcc > 0.99, f"PCC too low: {pcc:.6f}, expected > 0.99"
+    #     logger.success(f"✓ Output comparison passed (PCC={pcc:.6f})")
 
     logger.success(f"✓ Reference and TT comparison with {weight_type} weights successful")

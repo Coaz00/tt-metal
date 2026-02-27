@@ -5,9 +5,10 @@ import torch
 from transformers.configuration_utils import PretrainedConfig
 
 import ttnn
+from models.common.modules.tt_ccl import get_tt_ccl
 
 
-class MLASimple:
+class ttMLA:
     def __init__(
         self,
         config: PretrainedConfig,
@@ -27,7 +28,26 @@ class MLASimple:
         self.qk_nope_head_dim = config.qk_nope_head_dim
         self.qk_rope_head_dim = config.qk_rope_head_dim
         self.v_head_dim = config.v_head_dim
-        self.q_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
+        self.qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
+
+        self.default_compute_kernel_config = ttnn.init_device_compute_kernel_config(
+            mesh_device.arch(),
+            math_fidelity=ttnn.MathFidelity.HiFi2,
+            math_approx_mode=False,
+            fp32_dest_acc_en=False,
+            packer_l1_acc=True,
+        )
+
+        self.hifi4_fp32_compute_kernel_config = ttnn.init_device_compute_kernel_config(
+            mesh_device.arch(),
+            math_fidelity=ttnn.MathFidelity.HiFi4,
+            math_approx_mode=False,
+            fp32_dest_acc_en=True,
+            packer_l1_acc=True,
+        )
+
+        # Create CCL object for semaphore management
+        self.tt_ccl = get_tt_ccl(mesh_device)
 
         # Load weights to TT device
         self._load_weights(state_dict)
@@ -145,3 +165,204 @@ class MLASimple:
             "wkv_b2_weight": tuple(self.wkv_b2_weight.shape),
             "o_proj.weight": tuple(self.o_proj_weight.shape),
         }
+
+    # Expects ativation in form of:
+    # [1, batch_size == 1, seq_len // sp_factor, hidden_size // tp_factor]
+    def forward(self, hidden_states: ttnn.Tensor, rope_tensors: dict) -> ttnn.Tensor:
+        print(f"Starting MLA FWD pass")
+        mesh_size = self.mesh_device.shape
+        sp_factor = mesh_size[0]
+        tp_factor = mesh_size[1]
+
+        num_heads_local = self.num_heads // tp_factor
+
+        seq_len_local = hidden_states.shape[2]
+
+        # q_projection
+        tt_q = ttnn.linear(
+            hidden_states,
+            self.q_a_proj_weight,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            compute_kernel_config=self.default_compute_kernel_config,
+        )
+
+        # All reduce
+        print("Starting RS_1")
+        print("tt_q shape pre RS_1 is: ", tt_q.shape)
+        tt_q = ttnn.experimental.reduce_scatter_minimal_async(
+            tt_q,
+            persistent_output_buffers=None,
+            dim=3,
+            multi_device_global_semaphore=self.tt_ccl.get_and_cycle_rs_semaphore_handles(cluster_axis=1),
+            barrier_semaphore=self.tt_ccl.get_and_cycle_barrier_semaphore_handle(cluster_axis=1),
+            num_links=1,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            topology=ttnn.Topology.Linear,
+            cluster_axis=1,
+        )
+        print("END RS_1 start AG_1")
+        tt_q = ttnn.experimental.all_gather_async(
+            tt_q,
+            dim=3,
+            multi_device_global_semaphore=self.tt_ccl.get_and_cycle_ag_semaphore_handles(cluster_axis=1),
+            barrier_semaphore=self.tt_ccl.get_and_cycle_barrier_semaphore_handle(cluster_axis=1),
+            num_links=1,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            topology=ttnn.Topology.Linear,
+            cluster_axis=1,
+        )
+        print("END AG_1")
+
+        # rmsnorm
+        # weight config for rmsnorm ?
+        tt_q = ttnn.rms_norm(
+            tt_q,
+            weight=self.q_a_layernorm_weight,
+            epsilon=self.config.rms_norm_eps,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            compute_kernel_config=self.default_compute_kernel_config,
+        )
+        tt_q = ttnn.linear(
+            tt_q,
+            self.q_b_proj_weight,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            compute_kernel_config=self.default_compute_kernel_config,
+        )
+
+        # convert to
+        # [batch (1), num_heads_local, seq_len_local, qk_head_dim]
+        tt_q, _, _ = ttnn.experimental.nlp_create_qkv_heads(
+            tt_q,
+            num_heads=num_heads_local,
+            num_kv_heads=0,
+            transpose_k_heads=False,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        )
+
+        # split rope and nope
+        tt_q_nope = ttnn.slice(tt_q, [0, 0, 0, 0], [1, num_heads_local, seq_len_local, self.qk_nope_head_dim])
+        tt_q_rope = ttnn.slice(
+            tt_q, [0, 0, 0, self.qk_nope_head_dim], [1, num_heads_local, seq_len_local, self.qk_head_dim]
+        )
+
+        tt_q_nope = ttnn.linear(
+            tt_q_nope,
+            self.wkv_b1_weight,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            compute_kernel_config=self.default_compute_kernel_config,
+        )
+
+        # does this work with our rotary embedding approach ? (if tokens are split accross seq_parallel dim)
+        # tt_q_rope = ttnn.experimental.rotary_embedding_llama(tt_q_rope, rope_tensors["cos_matrix"], rope_tensors["sin_matrix"], rope_tensors["trans_matrix"], is_decode_mode=False)
+
+        # # concat rope and nope
+        tt_q = ttnn.concat([tt_q_nope, tt_q_rope], dim=-1)
+
+        # # kv
+        tt_kv = ttnn.linear(
+            hidden_states,
+            self.kv_a_proj_with_mqa_weight,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            compute_kernel_config=self.default_compute_kernel_config,
+        )
+
+        # # All reduce
+        tt_kv = ttnn.experimental.all_gather_async(
+            tt_kv,
+            dim=1,
+            multi_device_global_semaphore=self.tt_ccl.get_and_cycle_ag_semaphore_handles(cluster_axis=1),
+            barrier_semaphore=self.tt_ccl.get_and_cycle_barrier_semaphore_handle(cluster_axis=1),
+            num_links=1,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            topology=ttnn.Topology.Linear,
+            cluster_axis=1,
+        )
+        tt_kv = ttnn.experimental.fast_reduce_nc(
+            tt_kv, dims=[1], output=None, compute_kernel_config=self.hifi4_fp32_compute_kernel_config
+        )
+
+        # # split rope and nope
+        tt_kv_nope = ttnn.slice(tt_kv, [0, 0, 0, 0], [1, 1, seq_len_local, self.kv_lora_rank])
+        tt_kv_rope = ttnn.slice(
+            tt_kv, [0, 0, 0, self.kv_lora_rank], [1, 1, seq_len_local, self.kv_lora_rank + self.qk_rope_head_dim]
+        )
+
+        ttnn.deallocate(tt_kv)
+
+        tt_kv_nope = ttnn.rms_norm(
+            tt_kv_nope,
+            weight=self.kv_a_layernorm_weight,
+            epsilon=self.config.rms_norm_eps,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            compute_kernel_config=self.default_compute_kernel_config,
+        )
+        # tt_kv_rope = ttnn.experimental.rotary_embedding_llama(tt_kv_rope, rope_tensors["cos_matrix"], rope_tensors["sin_matrix"], rope_tensors["trans_matrix"], is_decode_mode=False)
+
+        # concat rope and nope
+        tt_kvpe = ttnn.concat([tt_kv_nope, tt_kv_rope], dim=-1)
+        ttnn.deallocate(tt_kv_rope)
+        tt_kvpe = ttnn.typecast(tt_kvpe, dtype=ttnn.bfloat8_b)
+
+        # expand v with wkv_b2
+        # workaround for #37416
+        tt_v_latent_post_repeat = ttnn.repeat(tt_kv_nope, [1, num_heads_local, 1, 1])
+        ttnn.deallocate(tt_kv_nope)
+
+        tt_v_embedding = ttnn.linear(
+            tt_v_latent_post_repeat,
+            self.wkv_b2_weight,
+            dtype=ttnn.bfloat8_b,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            compute_kernel_config=self.default_compute_kernel_config,
+        )
+
+        # tmp
+        attn_out = tt_v_embedding
+
+        # attn_out, _, _ = ttnn.transformer.ring_joint_scaled_dot_product_attention(
+        #     tt_q,
+        #     tt_kvpe,
+        #     tt_v_embedding,
+        #     None,
+        #     None,
+        #     None,
+        #     persistent_output_buffer_k=None, # todo fix
+        #     persistent_output_buffer_v=None, # todo fix
+        #     joint_strategy="rear",
+        #     logical_n=seq_len_local,
+        #     program_config=self.sdpa_program_config,
+        #     compute_kernel_config=self.default_compute_kernel_config,
+        #     dim=2,
+        #     multi_device_global_semaphore=None, # todo fix
+        #     num_links=1,
+        #     cluster_axis=0, # ? todo check should be rp axis
+        #     mesh_device= None, # submesh ?,
+        #     topology=ttnn.Topology.Linear,
+        #     subdevice_id=0,
+        #     ccl_core_grid_offset=0,
+        #     is_causal=True,
+        #     scale = 41, # todo fix
+        # )
+        # # output: [1, num_heads_local, seq_len_local, head_dim_v]
+
+        v_out = ttnn.experimental.nlp_concat_heads(attn_out, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        print("v_out shape: ", v_out.shape)
+        v_out = ttnn.linear(
+            v_out,
+            self.o_proj_weight,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            compute_kernel_config=self.default_compute_kernel_config,
+        )
+        out = ttnn.experimental.reduce_scatter_minimal_async(
+            v_out,
+            dim=3,
+            multi_device_global_semaphore=self.tt_ccl.get_and_cycle_rs_semaphore_handles(cluster_axis=1),
+            barrier_semaphore=self.tt_ccl.get_and_cycle_barrier_semaphore_handle(cluster_axis=1),
+            num_links=1,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            topology=ttnn.Topology.Linear,
+            cluster_axis=1,
+        )
+        print(f"MLA FWD pass complete")
+        return out
+        return None
