@@ -16,6 +16,7 @@ from ...layers.module import Module, ModuleList, Parameter
 from ...layers.normalization import RMSNorm
 from ...parallel.config import VaeHWParallelConfig
 from ...parallel.manager import CCLManager
+from ...utils import tensor
 from ...utils.conv3d import _ntuple, aligned_channels, get_conv3d_config, prepare_conv3d_weights
 from ...utils.substate import pop_substate, rename_substate
 from ...utils.tensor import bf16_tensor
@@ -862,7 +863,7 @@ class WanResample(Module):
         if self.is_3d and not self.is_upsample:  # downsample3d
             if feat_cache is not None:
                 if feat_cache.get(self._time_conv_cache_key) is None:
-                    feat_cache.update(self._time_conv_cache_key, ttnn.clone(x_conv_BTHWC), length=1)
+                    feat_cache.update(self._time_conv_cache_key, x_conv_BTHWC, length=1)
                 else:
                     x_conv_BTHWC = self.time_conv.forward(x_conv_BTHWC, logical_h, feat_cache=feat_cache)
             else:
@@ -1447,18 +1448,53 @@ class FeatureCache(TracerInputLeaf):
     def get(self, key: str) -> ttnn.Tensor | None:
         return self._tensors.get(key)
 
+    def set(self, key: str, value: ttnn.Tensor) -> None:
+        if key in self._tensors:
+            # preserve cached tensor address to support tracing
+            ttnn.copy(value, self._tensors[key])
+        elif self._frozen:
+            msg = f"cannot add new key {key} to frozen FeatureCache"
+            raise ValueError(msg)
+        else:
+            self._tensors[key] = value
+
     def update(self, key: str, value: ttnn.Tensor, /, *, length: int) -> ttnn.Tensor | None:
-        _, t_size, _, _, _ = value.shape
+        """Update a cached activation and return the previous value.
 
+        Stores ``value`` under ``key``, trimming or front-padding along the temporal dimension (dim
+        1) so that the stored tensor has exactly ``length`` frames.  If the new value is shorter
+        than ``length`` and a cached tensor already exists, the tail of the old cache is prepended
+        to fill the gap.
+
+        Args:
+            key: Cache slot identifier.
+            value: New activation tensor with shape ``(B, T, H, W, C)``.
+            length: Desired temporal length of the stored tensor.
+
+        Returns:
+            The previously cached tensor (cloned), or ``None`` if the slot was empty.
+        """
         cached = self._tensors.get(key)
+        cached = ttnn.clone(cached) if cached is not None else None
 
-        diff = t_size - length
-        if diff > 0:
+        if cached is not None and cached.shape[1] != length:
+            msg = f"existing cache for key {key} has temporal length {cached.shape[1]}, expected {length}"
+            raise ValueError(msg)
+
+        short = length - value.shape[1]
+        if short < 0:
             value = value[:, -length:]
-        elif diff < 0 and cached is not None:
-            # Current activation is too short, so append the cached activation as well
-            value = ttnn.concat([cached[:, diff:], value], dim=1)  # TODO
-        self._tensors[key] = value
+        elif short > 0:
+            if cached is not None:
+                # Current activation is too short, so prepend the cached activation
+                prepend = min(cached.shape[1], short)
+                value = ttnn.concat([cached[:, -prepend:], value], dim=1)
+                short -= prepend
+
+            if short > 0:
+                value = tensor.pad_single(value, dim=1, front=short, value=0.0)
+
+        self.set(key, value)
 
         return cached
 

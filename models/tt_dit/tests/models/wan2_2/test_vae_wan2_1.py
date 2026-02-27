@@ -1000,9 +1000,7 @@ def test_wan_decoder3d(mesh_device, B, C, T, H, W, mean, std, h_axis, w_axis, nu
         logger.info(f"torch output shape: {torch_output.shape}")
 
         logger.info(f"running tt model")
-        tt_output, new_logical_h = (tt_model if i == 0 else tracer)(
-            tt_input_tensor, logical_h, feat_cache=tt_feat_cache
-        )
+        tt_output, new_logical_h = tt_model(tt_input_tensor, logical_h, feat_cache=tt_feat_cache)
 
         tt_output_torch = tensor.to_torch(tt_output, mesh_axes=[..., h_axis, w_axis, None])
         tt_output_torch = conv_unpad_height(tt_output_torch, new_logical_h)
@@ -1264,9 +1262,7 @@ def test_wan_encoder3d(mesh_device, B, C, T, H, W, mean, std, h_axis, w_axis, nu
         logger.info(f"torch output shape: {torch_output.shape}")
 
         logger.info(f"running tt model")
-        tt_output, new_logical_h = (tt_model if i == 0 else tracer)(
-            tt_input_tensor, logical_h, feat_cache=tt_feat_cache
-        )
+        tt_output, new_logical_h = tt_model(tt_input_tensor, logical_h, feat_cache=tt_feat_cache)
 
         tt_output_torch = tensor.to_torch(tt_output, mesh_axes=[..., h_axis, w_axis, None])
         tt_output_torch = conv_unpad_height(tt_output_torch, new_logical_h)
@@ -1445,10 +1441,7 @@ def _check_feat_cache(
             tt_feat_torch = conv_unpad_height(tt_feat_torch, logical_h)
         tt_feat_torch = tt_feat_torch.permute(0, 4, 1, 2, 3)
 
-        if tt_feat_torch.shape[1] != torch_feat.shape[1] or tt_feat_torch.shape[3] != torch_feat.shape[3]:
-            logger.warning(f"Trimming TTNN features from {tt_feat_torch.shape} to {torch_feat.shape}")
-            tt_feat_torch = tt_feat_torch[:, : torch_feat.shape[1], :, : torch_feat.shape[3], :]
-
+        tt_feat_torch = tt_feat_torch[:, : torch_feat.shape[1], -torch_feat.shape[2] :, : torch_feat.shape[3], :]
         trimmed_torch_feat = torch_feat[:, :, -tt_feat_torch.shape[2] :, :, :]
 
         assert_quality(trimmed_torch_feat, tt_feat_torch, pcc=pcc, relative_rmse=relative_rmse)
