@@ -285,3 +285,33 @@ class Qwen3VLForConditionalGeneration(QwenVLGenerator, SupportsMultiModal):
             super().update_rope_deltas(rope_deltas_list)
 
         return super().decode_forward(*args, **kwargs)
+
+    def warmup_model_prefill(self, kv_cache, enable_trace, can_sample_on_device, non_greedy_decoding_on_device) -> None:
+        """Warmup vision encoder for Qwen3-VL"""
+        if self.visual_model is None:
+            logger.warning("No visual model available for vision warmup")
+            return
+
+        # Get vision config from HF config
+        vision_config = self.model_args.hf_config.vision_config
+        patch_size = getattr(vision_config, "patch_size", 14)
+        temporal_patch_size = getattr(vision_config, "temporal_patch_size", 2)
+        in_channels = getattr(vision_config, "in_channels", 3)
+
+        # Create synthetic image for vision warmup
+        # For Qwen VL, pixel_values is [num_patches, patch_features] where patch_features = temporal_patch_size * in_channels * patch_size * patch_size
+        # Using a small 14x14 grid (196 patches) for warmup
+        grid_h, grid_w = 14, 14
+        num_patches = grid_h * grid_w
+        patch_features = temporal_patch_size * in_channels * patch_size * patch_size
+
+        warmup_pixel_values = torch.zeros((num_patches, patch_features), dtype=torch.float32)
+        warmup_grid_thw = torch.tensor([[1, grid_h, grid_w]], dtype=torch.int32)
+
+        logger.info(f"Warming up Qwen3-VL vision encoder with {num_patches} patches")
+
+        try:
+            _ = self.visual_model(warmup_pixel_values, grid_thw=warmup_grid_thw)
+            logger.info("Qwen3-VL vision encoder warmup completed")
+        except Exception as e:
+            logger.warning(f"Qwen3-VL vision warmup failed: {e}")

@@ -140,6 +140,42 @@ class Generator(WarmupForwardMixin):
                         param,
                     )
 
+        # Vision warmup for multimodal models
+        if getattr(self.model_args[0], "is_multimodal", False):
+            vision_chunk_size = getattr(self.model_args[0], "vision_chunk_size", 896)
+            vision_channels = getattr(self.model_args[0], "vision_in_channels", 3)
+
+            logger.info(f"Warming up vision encoder with image size {vision_chunk_size}x{vision_chunk_size}")
+
+            # Create synthetic image for vision warmup
+            # pixel_values is a list (one per user), each element is (num_images, C, H, W)
+            warmup_pixel_values = [torch.zeros((1, vision_channels, vision_chunk_size, vision_chunk_size))]
+
+            # Minimal text tokens for vision warmup pass
+            warmup_seq_len = 128
+            warmup_tokens = torch.zeros(1, warmup_seq_len, dtype=torch.long)
+            warmup_prompt_lens = torch.tensor([warmup_seq_len], dtype=torch.long)
+            warmup_empty_slots = list(range(1))
+
+            page_table_warmup = None
+            if kv_cache is not None and kv_cache[0] is not None:
+                block_size = get_block_size(kv_cache[0])
+                num_blocks = num_blocks_in_seq(warmup_seq_len, block_size)
+                page_table_warmup = torch.zeros(1, num_blocks, dtype=torch.int32)
+
+            self.prefill_forward_text(
+                warmup_tokens,
+                page_table_warmup,
+                kv_cache,
+                warmup_prompt_lens,
+                warmup_empty_slots,
+                enable_trace,
+                0,  # model_id
+                None,  # sampling_params
+                pixel_values=warmup_pixel_values,
+            )
+            logger.info("Vision encoder warmup completed")
+
     def _capture_trace_prefill(
         self,
         prefill_ids,
