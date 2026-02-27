@@ -1,8 +1,7 @@
 # --- Meshes ---------------------------------------------------------------
-
 mesh_descriptors {
   name: "M0"
-  arch: WORMHOLE_B0
+  arch: BLACKHOLE
   device_topology { dims: [ 1, 16 ] }
   host_topology   { dims: [ 1, 2 ] }
   channels {
@@ -11,5 +10,7 @@ mesh_descriptors {
   }
 }
 
-# --- Instantiation ----------------------------------------------------------
-top_level_instance { graph { graph_descriptor: "M0" mesh_id: 0 } }
+# --- Instantiation -------------------------------------------------------
+top_level_instance {
+  mesh { mesh_descriptor: "M0" mesh_id: 0 }
+}

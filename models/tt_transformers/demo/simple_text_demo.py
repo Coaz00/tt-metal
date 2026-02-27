@@ -774,6 +774,7 @@ def prepare_generator_args(
             "P300": (1, 2),
             "P150x4": (1, 4),
             "P150x8": (1, 8),
+            "2xP150x8": (1, 16),
             "BHGLX": (8, 4),
         }.get(os.environ.get("MESH_DEVICE"), len(ttnn.get_device_ids()))
     ],
@@ -918,9 +919,11 @@ def test_demo_text(
     logger.info(f"Reading inputs...")
     profiler.start("loading_inputs")
     if len(input_prompts) == 1:  # Manual input
+        logger.info(f"Using manual input prompts: {input_prompts}")
         input_prompts = input_prompts * global_batch_size
         all_prompts = input_prompts
     else:  # Inputs from file
+        logger.info(f"Using input prompts from file: {input_prompts}")
         input_prompts, all_prompts = load_inputs(input_prompts, global_batch_size, instruct)
     profiler.end("loading_inputs")
 

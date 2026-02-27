@@ -38,6 +38,7 @@ def get_mesh_device_name(num_devices, mesh_device_name):
             2: "P300",
             4: "P150x4",
             8: "P150x8",
+            16: "2xP150x8",
             32: "BHGLX",
         }
     elif is_wormhole_b0():

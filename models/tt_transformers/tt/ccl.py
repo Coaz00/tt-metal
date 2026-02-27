@@ -39,6 +39,7 @@ def get_num_links(mesh_device, cluster_axis=None):
         "T3K": (1, 1),
         "P150x4": (2, 2),
         "P150x8": (2, 2),
+        "2xP150x8": (2, 2),
         "P300": (2, 2),
         "BHGLX": (4, 3),
         "TG": (4, 3),

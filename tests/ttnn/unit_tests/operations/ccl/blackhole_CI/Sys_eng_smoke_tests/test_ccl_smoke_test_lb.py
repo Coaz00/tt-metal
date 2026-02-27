@@ -118,11 +118,12 @@ def test_ccl_ddr_smoke_test(
 @pytest.mark.parametrize(
     "num_devices, ag_output_shape, dim, layout, all_gather_topology, cluster_axis, ag_input_dtype",
     [
+        (8, [1, 1, 6016, 8192], 3, ttnn.TILE_LAYOUT, ttnn.Topology.Linear, 1, ttnn.bfloat16),
         (4, [1, 1, 6016, 8192], 3, ttnn.TILE_LAYOUT, ttnn.Topology.Linear, 0, ttnn.bfloat16),
         (2, [1, 1, 6016, 4096], 3, ttnn.TILE_LAYOUT, ttnn.Topology.Linear, 1, ttnn.uint32),
         (2, [1, 1, 6016, 4096], 3, ttnn.TILE_LAYOUT, ttnn.Topology.Linear, 1, ttnn.bfloat8_b),
     ],
-    ids=["horizontal_test_bf16", "vertical_test_u32", "vertical_test_bf8"],
+    ids=["1x16_test_bf16", "horizontal_test_bf16", "vertical_test_u32", "vertical_test_bf8"],
 )
 @pytest.mark.parametrize(
     "mem_config_input, mem_config_ag",

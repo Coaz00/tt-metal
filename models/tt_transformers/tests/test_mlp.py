@@ -2,7 +2,6 @@
 
 # SPDX-License-Identifier: Apache-2.0
 
-import os
 
 import pytest
 import torch
@@ -18,20 +17,21 @@ from models.tt_transformers.tt.model_config import ModelArgs
 from models.tt_transformers.tt.prefetcher import Prefetcher
 
 
+# @pytest.mark.parametrize(
+#     "mesh_device",
+#     [
+#         {"N150": (1, 1), "N300": (1, 2), "T3K": (1, 8), "TG": (8, 4), "2xP150x8":(1, 16)}.get(
+#             os.environ.get("MESH_DEVICE"), len(ttnn.get_device_ids())
+#         )
+#     ],
+#     indirect=True,
+# )
 @torch.no_grad()
 @pytest.mark.parametrize(
     "use_prefetcher",
     ([False]),
 )
-@pytest.mark.parametrize(
-    "mesh_device",
-    [
-        {"N150": (1, 1), "N300": (1, 2), "T3K": (1, 8), "TG": (8, 4)}.get(
-            os.environ.get("MESH_DEVICE"), len(ttnn.get_device_ids())
-        )
-    ],
-    indirect=True,
-)
+@pytest.mark.parametrize("mesh_device", [pytest.param((1, 16), id="1x16_grid")], indirect=True)
 @pytest.mark.parametrize(
     "seq_len",
     (64 * 1024, 32 * 1024, 512, 32),
@@ -40,7 +40,7 @@ from models.tt_transformers.tt.prefetcher import Prefetcher
     "batch_size",
     (1,),
 )
-@pytest.mark.parametrize("device_params", [{"fabric_config": True}], indirect=True)
+@pytest.mark.parametrize("device_params", [{"fabric_config": ttnn.FabricConfig.FABRIC_2D}], indirect=True)
 def test_mlp_inference(seq_len, batch_size, mesh_device, reset_seeds, ensure_gc, use_prefetcher):
     dtype = ttnn.bfloat8_b
     mode = Mode.DECODE if seq_len <= 32 else Mode.PREFILL

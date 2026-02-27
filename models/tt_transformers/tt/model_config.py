@@ -604,7 +604,9 @@ class ModelArgs:
                 self.n_heads % self.cluster_shape[1] == 0
             ), f"n_heads must be divisible by num_devices: {self.n_heads} % {self.cluster_shape[1]}"
 
-            assert self.n_kv_heads % self.cluster_shape[1] == 0, "n_kv_heads must be divisible by num_devices"
+            assert (
+                self.n_kv_heads % self.cluster_shape[1] == 0
+            ), f"n_kv_heads must be divisible by num_devices, got {self.n_kv_heads} % {self.cluster_shape[1]}"
             self.n_local_heads = self.n_heads // self.cluster_shape[1]
             self.qkv_size = self.head_dim * (2 * self.n_kv_heads + self.n_heads)
             self.min_kv_prefill_shard_seqlen = (self.tile_size * 8 * 8) / (self.n_kv_heads // self.cluster_shape[1])
@@ -4217,6 +4219,7 @@ def determine_device_name(mesh_device):
             2: "P300",
             4: "P150x4",
             8: "P150x8",
+            16: "2xP150x8",
             32: "BHGLX",
         }
     elif is_wormhole_b0():
