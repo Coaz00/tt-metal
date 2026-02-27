@@ -956,7 +956,8 @@ class MLA1D(AbstractModule):
             ).float()
             _ss_v2 = _t_vout2.shape[2] // _nr_fo
             for _r_fo in range(_nr_fo):
-                _real_v2 = _t_vout2[:, :, _r_fo * _ss_v2 : _r_fo * _ss_v2 + 1, :]
+                # Check ALL users of each row (not just user-0) to catch tile-level corruption
+                _real_v2 = _t_vout2[:, :, _r_fo * _ss_v2 : (_r_fo + 1) * _ss_v2, :]
                 _mx_v2 = _real_v2.abs().max().item()
                 if _mx_v2 > 100 or not _torch_mla_fo.isfinite(_real_v2).all().item():
                     _log_mla_fo.warning(
@@ -1475,6 +1476,10 @@ class MLA1D(AbstractModule):
         v_out = ttnn.experimental.view(v_out, (1, 1, bsz // mesh_shape[1], num_heads * v_head_dim))
         # All_gather
         v_out = ttnn.to_memory_config(v_out, memory_config=ttnn.L1_MEMORY_CONFIG)
+        import os as _os_ag
+
+        if _os_ag.getenv("DEEPSEEK_DEBUG_SYNC_BEFORE_BROADCAST") == "1":
+            ttnn.synchronize_device(v_out.device())
         v_out = ttnn.all_broadcast(v_out, **cfg["wo_ag_decode"])
         v_out = ttnn.concat(v_out, dim=2)
         v_out = ttnn.tilize(v_out)
