@@ -30,7 +30,16 @@ UNET_LOOP_PCC = {"10": 0.996, "50": 0.996}
 
 
 @torch.no_grad()
-def run_unet_inference(ttnn_device, is_ci_env, image_resolution, prompts, num_inference_steps, debug_mode):
+def run_unet_inference(
+    ttnn_device,
+    is_ci_env,
+    is_ci_v2_env,
+    model_location_generator,
+    image_resolution,
+    prompts,
+    num_inference_steps,
+    debug_mode,
+):
     torch.manual_seed(0)
 
     if isinstance(prompts, str):
@@ -50,19 +59,27 @@ def run_unet_inference(ttnn_device, is_ci_env, image_resolution, prompts, num_in
     # 0. Set up default height and width for unet
     height, width = image_resolution
 
-    # 1. Load components
+    # 1. Load components - use CIv2 LFC when available
+    base_model_name = "stabilityai/stable-diffusion-xl-base-1.0"
+    base_model_location = model_location_generator(
+        "stable-diffusion-xl-base-1.0", download_if_ci_v2=True, ci_v2_timeout_in_s=1800
+    )
     base = DiffusionPipeline.from_pretrained(
-        "stabilityai/stable-diffusion-xl-base-1.0",
+        base_model_name if not is_ci_v2_env else base_model_location,
         torch_dtype=torch.float32,
         use_safetensors=True,
-        local_files_only=is_ci_env,
+        local_files_only=is_ci_env or is_ci_v2_env,
     )
 
+    refiner_model_name = "stabilityai/stable-diffusion-xl-refiner-1.0"
+    refiner_model_location = model_location_generator(
+        "stable-diffusion-xl-refiner-1.0", download_if_ci_v2=True, ci_v2_timeout_in_s=1800
+    )
     pipeline = DiffusionPipeline.from_pretrained(
-        "stabilityai/stable-diffusion-xl-refiner-1.0",
+        refiner_model_name if not is_ci_v2_env else refiner_model_location,
         torch_dtype=torch.float32,
         use_safetensors=True,
-        local_files_only=is_ci_env,
+        local_files_only=is_ci_env or is_ci_v2_env,
         text_encoder_2=base.text_encoder_2,
         vae=base.vae,
     )
@@ -365,6 +382,8 @@ def run_unet_inference(ttnn_device, is_ci_env, image_resolution, prompts, num_in
 def test_unet_loop(
     device,
     is_ci_env,
+    is_ci_v2_env,
+    model_location_generator,
     image_resolution,
     prompt,
     loop_iter_num,
@@ -374,4 +393,6 @@ def test_unet_loop(
     if image_resolution != (1024, 1024):
         pytest.skip(f"Unsupported image resolution: {image_resolution}. Only (1024, 1024) is supported.")
 
-    return run_unet_inference(device, is_ci_env, image_resolution, prompt, loop_iter_num, debug_mode)
+    return run_unet_inference(
+        device, is_ci_env, is_ci_v2_env, model_location_generator, image_resolution, prompt, loop_iter_num, debug_mode
+    )
