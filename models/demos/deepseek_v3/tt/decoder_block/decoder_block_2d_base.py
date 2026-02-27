@@ -125,9 +125,50 @@ class DecoderBlock2DBase(DecoderBlockBase):
         ttnn.deallocate(mla_norm_in)
 
         # MLA
+        import os as _os
+
+        if _os.getenv("DEEPSEEK_DEBUG_MLP_FORWARD") == "1":
+            import torch as _torch
+            from loguru import logger as _log
+
+            _mesh = page_table.device()
+            _nr = _mesh.shape[0]
+            _t_in = ttnn.to_torch(
+                mla_norm_out,
+                mesh_composer=ttnn.ConcatMesh2dToTensor(_mesh, dims=(-2, -1), mesh_shape=tuple(_mesh.shape)),
+            ).float()
+            _ss = _t_in.shape[2] // _nr
+            for _r in range(_nr):
+                _real_in = _t_in[:, :, _r * _ss : _r * _ss + 1, :]
+                _mx_in = _real_in.abs().max().item()
+                if _mx_in > 100 or not _torch.isfinite(_real_in).all().item():
+                    _log.warning(
+                        f"  DECODER mla_norm_out(MLA input) row{_r}: abs_max={_mx_in:.3e}  finite={_torch.isfinite(_real_in).all().item()}"
+                    )
+            _log.debug(f"  DECODER mla_norm_out abs_max across all rows: {_t_in.abs().max().item():.3e}")
+
         mla_norm_out = ttnn.to_memory_config(mla_norm_out, **cfg["mla_reshard"])
         mla_out = MLA2D.forward_decode(mla_norm_out, position_idxs, cfg["mla"], rope_tensors, page_table)
         ttnn.deallocate(mla_norm_out)
+
+        if _os.getenv("DEEPSEEK_DEBUG_MLP_FORWARD") == "1":
+            import torch as _torch
+            from loguru import logger as _log
+
+            _mesh = page_table.device()
+            _nr = _mesh.shape[0]
+            _t = ttnn.to_torch(
+                mla_out,
+                mesh_composer=ttnn.ConcatMesh2dToTensor(_mesh, dims=(-2, -1), mesh_shape=tuple(_mesh.shape)),
+            ).float()
+            _ss = _t.shape[2] // _nr
+            for _r in range(_nr):
+                _real = _t[:, :, _r * _ss : _r * _ss + 1, :]
+                _mx = _real.abs().max().item()
+                if _mx > 100 or not _torch.isfinite(_real).all().item():
+                    _log.warning(
+                        f"  DECODER mla_out row{_r}: abs_max={_mx:.3e}  finite={_torch.isfinite(_real).all().item()}"
+                    )
 
         # MLA Residual
         x += mla_out
@@ -142,6 +183,19 @@ class DecoderBlock2DBase(DecoderBlockBase):
         mlp_norm_out = ttnn.to_memory_config(mlp_norm_out, **cfg["mlp_reshard"])
         mlp_out = cls.forward_mlp_decode(mlp_norm_out, cfg["mlp"])
         ttnn.deallocate(mlp_norm_out)
+
+        if _os.getenv("DEEPSEEK_DEBUG_MLP_FORWARD") == "1":
+            _t2 = ttnn.to_torch(
+                mlp_out,
+                mesh_composer=ttnn.ConcatMesh2dToTensor(_mesh, dims=(-2, -1), mesh_shape=tuple(_mesh.shape)),
+            ).float()
+            for _r in range(_nr):
+                _real2 = _t2[:, :, _r * _ss : _r * _ss + 1, :]
+                _mx2 = _real2.abs().max().item()
+                if _mx2 > 100 or not _torch.isfinite(_real2).all().item():
+                    _log.warning(
+                        f"  DECODER mlp_out row{_r}: abs_max={_mx2:.3e}  finite={_torch.isfinite(_real2).all().item()}"
+                    )
 
         # MLP Residual
         x += mlp_out

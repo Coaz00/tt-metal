@@ -254,23 +254,103 @@ class RowBatchedModel(SharedStateAddOn, AbstractModule):
 
         else:
             # Normal mode: run all layers
-            for (block_cfg, BlockClass), page_table in zip(
-                itertools.chain(
-                    zip(cfg["mlp_decoder_block"], itertools.repeat(DecoderBlock2D)),
-                    zip(cfg["moe_decoder_block"], itertools.repeat(MoEDecoderBlock2D)),
-                ),
-                page_tables,
-                strict=True,
+            from loguru import logger as _logger
+
+            def _check_tensor(t: ttnn.Tensor, mesh, label: str) -> bool:
+                t_torch = ttnn.to_torch(
+                    t,
+                    mesh_composer=ttnn.ConcatMesh2dToTensor(mesh, dims=(-2, -1), mesh_shape=mesh.shape),
+                ).float()
+                num_rows = mesh.shape[0]
+                # Each row's real data occupies stride positions in dim 2 (tile-padded seq dim).
+                # Position r*stride is seq_pos=0 for row r (the only real data position).
+                seq_stride = t_torch.shape[2] // num_rows
+                all_fine = True
+                for r in range(num_rows):
+                    real_r = t_torch[:, :, r * seq_stride : r * seq_stride + 1, :]
+                    fin_r = torch.isfinite(real_r).all().item()
+                    mx_r = real_r.abs().max().item()
+                    _logger.debug(f"  {label} row{r}: abs_max={mx_r:.3f}  finite={fin_r}")
+                    if not fin_r or mx_r > 100:
+                        all_fine = False
+                return all_fine
+
+            for layer_idx, ((block_cfg, BlockClass), page_table) in enumerate(
+                zip(
+                    itertools.chain(
+                        zip(cfg["mlp_decoder_block"], itertools.repeat(DecoderBlock2D)),
+                        zip(cfg["moe_decoder_block"], itertools.repeat(MoEDecoderBlock2D)),
+                    ),
+                    page_tables,
+                    strict=True,
+                )
             ):
+                _mesh = page_table.device()
+                _check_tensor(x, _mesh, f"layer {layer_idx:2d} ({BlockClass.__name__}) INPUT ")
                 x = BlockClass.forward_decode(x, position_idxs, block_cfg, rope_tensors, page_table)
+                out_fine = _check_tensor(x, _mesh, f"layer {layer_idx:2d} ({BlockClass.__name__}) OUTPUT")
+                if not out_fine:
+                    _logger.warning(f"  layer {layer_idx:2d}: bad output detected (inf/nan or large values)")
+
+        import os as _os
+
+        _debug_final = _os.getenv("DEEPSEEK_DEBUG_MLP_FORWARD") == "1"
+        if _debug_final:
+            import torch as _torch
+            from loguru import logger as _log
+
+            _final_mesh = page_tables[-1].device()
 
         x = ttnn.to_memory_config(x, **cfg["norm_reshard"])
         x = DistributedRMSNorm.forward_decode(x, cfg["norm"])
 
+        if _debug_final:
+            # Probe BEFORE all_gather: tensor is TP-sharded [1,1,1,H/cols] per device.
+            # ConcatMesh2dToTensor(dims=(-2,-1)) correctly reconstructs [1,1,num_rows,H].
+            # Each position in dim -2 corresponds to a different row/user.
+            _n = ttnn.to_torch(
+                x,
+                mesh_composer=ttnn.ConcatMesh2dToTensor(
+                    _final_mesh, dims=(-2, -1), mesh_shape=tuple(_final_mesh.shape)
+                ),
+            ).float()
+            _num_users = _n.shape[2]
+            for _u in range(_num_users):
+                _u_n = _n[:, :, _u : _u + 1, :]
+                _log.debug(
+                    f"  after_norm user {_u}: abs_max={_u_n.abs().max():.3f}"
+                    f"  finite={_torch.isfinite(_u_n).all().item()}"
+                )
+
         ccl = cfg["lm_head"]["ccl"]
 
         x = ttnn.experimental.all_gather_async(x, **ccl.populate_all_gather_runtime_args(cfg["lm_head"]["all_gather"]))
+
         x = LMHead1D.forward_decode(x, cfg["lm_head"])
+
+        if _debug_final:
+            # Probe AFTER LM head: tensor is vocab-sharded [1,1,1,V/cols] per device.
+            # ConcatMesh2dToTensor(dims=(-2,-1)) correctly reconstructs [1,1,num_rows,V].
+            _out = ttnn.to_torch(
+                x,
+                mesh_composer=ttnn.ConcatMesh2dToTensor(
+                    _final_mesh, dims=(-2, -1), mesh_shape=tuple(_final_mesh.shape)
+                ),
+            ).float()
+            vocab = _out.shape[-1]
+            _out_flat = _out.reshape(1, -1, vocab)  # [1, num_rows, vocab]
+            _num_users = _out_flat.shape[1]
+            _log.debug(
+                f"  lm_head OUTPUT: shape={tuple(_out_flat.shape)}"
+                f"  finite={_torch.isfinite(_out_flat).all().item()}"
+            )
+            for _u in range(_num_users):
+                _u_out = _out_flat[0, _u, :]
+                _log.debug(
+                    f"    user {_u}: abs_max={_u_out.abs().max():.3f}"
+                    f"  finite={_torch.isfinite(_u_out).all().item()}"
+                )
+
         return x
 
     @classmethod

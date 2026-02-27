@@ -292,6 +292,15 @@ class MoEGate(AbstractModule):
     def forward(cls, x: ttnn.Tensor, cfg: RunDecodeConfig | RunPrefillConfig) -> tuple[ttnn.Tensor, ttnn.Tensor]:
         assert x.memory_config() == cfg["input_memory_config"]
 
+        import os as _os
+
+        _debug_gate = _os.getenv("DEEPSEEK_DEBUG_MLP_FORWARD") == "1"
+        if _debug_gate:
+            import torch as _torch
+            from loguru import logger as _log
+
+            _debug_mesh = cfg["mesh_device"]
+
         # Gate projections
         if cfg["linear_fallback"]:
             logits = cls.linear_fallback_op(x, **cfg["linear_fallback_config"], **cfg["gate_proj"])
@@ -311,6 +320,18 @@ class MoEGate(AbstractModule):
             memory_config=cfg["add_score_correction_bias"]["memory_config"],
             dtype=cfg["add_score_correction_bias"]["dtype"],
         )
+        if _debug_gate:
+            _sb = ttnn.to_torch(
+                scores_with_bias,
+                mesh_composer=ttnn.ConcatMesh2dToTensor(
+                    _debug_mesh, dims=(-2, -1), mesh_shape=tuple(_debug_mesh.shape)
+                ),
+            ).float()
+            _real_sb = _sb[:, :, 0:1, :]
+            _log.debug(
+                f"  gate scores_with_bias: min={_real_sb.min():.4f}  max={_real_sb.max():.4f}"
+                f"  has_neg={(_real_sb < 0).any().item()}  has_zero={(_real_sb == 0).any().item()}"
+            )
         # Reshape scores to expert groups
         expert_scores_grouped = ttnn.reshape(scores_with_bias, **cfg["reshape_scores"])
         num_experts_per_group = expert_scores_grouped.shape[3]
@@ -383,6 +404,20 @@ class MoEGate(AbstractModule):
         active_experts_scores = ttnn.mul(scores_with_bias, active_experts_mask, **cfg["mul_scores_with_mask"])
         ttnn.deallocate(scores_with_bias)
         ttnn.deallocate(active_experts_mask)
+        if _debug_gate:
+            _aes = ttnn.to_torch(
+                active_experts_scores,
+                mesh_composer=ttnn.ConcatMesh2dToTensor(
+                    _debug_mesh, dims=(-2, -1), mesh_shape=tuple(_debug_mesh.shape)
+                ),
+            ).float()
+            _real_aes = _aes[:, :, 0:1, :]
+            _finite_aes = _real_aes[_torch.isfinite(_real_aes)]
+            _log.debug(
+                f"  gate active_experts_scores: has_nan={_torch.isnan(_real_aes).any().item()}"
+                f"  has_posinf={(_real_aes == float('inf')).any().item()}"
+                f"  finite_abs_max={_finite_aes.abs().max().item() if len(_finite_aes) > 0 else float('nan'):.3f}"
+            )
 
         # calculate top-k experts
         if cfg["topk_fallback"]:
@@ -418,6 +453,20 @@ class MoEGate(AbstractModule):
             dtype=cfg["multiply_expert_scale"]["dtype"],
         )
         ttnn.deallocate(expert_scale)
+
+        if _debug_gate:
+            _tn = ttnn.to_torch(
+                topk_experts_scores_normalized,
+                mesh_composer=ttnn.ConcatMesh2dToTensor(
+                    _debug_mesh, dims=(-2, -1), mesh_shape=tuple(_debug_mesh.shape)
+                ),
+            ).float()
+            _real_tn = _tn[:, :, 0:1, :]
+            _log.debug(
+                f"  gate topk_scores_normalized: has_nan={_torch.isnan(_real_tn).any().item()}"
+                f"  has_inf={not _torch.isfinite(_real_tn).all().item()}"
+                f"  abs_max={_real_tn.abs().max():.4f}"
+            )
 
         return topk_experts_scores_normalized, topk_experts_indices
 

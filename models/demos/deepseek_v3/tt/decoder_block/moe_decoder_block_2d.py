@@ -106,6 +106,15 @@ class MoEDecoderBlock2D(DecoderBlock2DBase):
         tp_size = cfg["moe"]["mesh_device"].shape[1]
         x_dim = x.shape[-1]
 
+        import os as _os
+
+        _debug_mlp = _os.getenv("DEEPSEEK_DEBUG_MLP_FORWARD") == "1"
+        if _debug_mlp:
+            import torch as _torch
+            from loguru import logger as _log
+
+            _mesh = cfg["moe"]["mesh_device"]
+
         if x_dim == hidden_size // tp_size:
             # Input is TP-sharded, need to gather
             # Use MoE's all_gather config which outputs the correct memory layout for MoEGate
@@ -117,10 +126,32 @@ class MoEDecoderBlock2D(DecoderBlock2DBase):
             # Should always be TP-sharded at this point
             assert False, f"Expected TP-sharded input with dim {hidden_size // tp_size}, got dim {x_dim}"
 
+        if _debug_mlp:
+            _xg = ttnn.to_torch(
+                x_gathered,
+                mesh_composer=ttnn.ConcatMesh2dToTensor(_mesh, dims=(-2, -1), mesh_shape=tuple(_mesh.shape)),
+            ).float()
+            _real_xg = _xg[:, :, 0:1, :]
+            _log.debug(
+                f"  x_gathered (after all_gather): real_abs_max={_real_xg.abs().max():.3f}"
+                f"  finite={_torch.isfinite(_real_xg).all().item()}"
+            )
+
         # Run both MoE and SharedExpert with the same gathered input
         mlp_out = moe_forward_fn(x_gathered, cfg["moe"])
         # SharedExpert now always expects collective ops to be handled by caller
         shared_expert_out = shared_expert_forward_fn(x_gathered, cfg["shared_expert"])
+
+        if _debug_mlp:
+            for _name, _t in [("moe_out", mlp_out), ("se_out", shared_expert_out)]:
+                _tt = ttnn.to_torch(
+                    _t,
+                    mesh_composer=ttnn.ConcatMesh2dToTensor(_mesh, dims=(-2, -1), mesh_shape=tuple(_mesh.shape)),
+                ).float()
+                _real = _tt[:, :, 0:1, :]
+                _log.debug(
+                    f"  {_name}: real_abs_max={_real.abs().max():.3f}  finite={_torch.isfinite(_real).all().item()}"
+                )
 
         # Add outputs first, then reduce_scatter the combined result
         combined_out = ttnn.add(mlp_out, shared_expert_out)
@@ -136,6 +167,16 @@ class MoEDecoderBlock2D(DecoderBlock2DBase):
                 **ccl_moe.populate_reduce_scatter_runtime_args(cfg["moe"]["final_output_reduce_scatter"]),
             )
             ttnn.deallocate(combined_out)
+            if _debug_mlp:
+                _out = ttnn.to_torch(
+                    output,
+                    mesh_composer=ttnn.ConcatMesh2dToTensor(_mesh, dims=(-2, -1), mesh_shape=tuple(_mesh.shape)),
+                ).float()
+                _real_out = _out[:, :, 0:1, :]
+                _log.debug(
+                    f"  mlp_output (after reduce_scatter): real_abs_max={_real_out.abs().max():.3f}"
+                    f"  finite={_torch.isfinite(_real_out).all().item()}"
+                )
             # Cleanup gathered tensor
             if x_gathered is not x:
                 ttnn.deallocate(x_gathered)

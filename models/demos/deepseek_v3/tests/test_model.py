@@ -193,6 +193,37 @@ def _expected_reference_output_shape(token_count: int, hf_config: PretrainedConf
     return (1, token_count, hf_config.vocab_size)
 
 
+def _attach_layer_stat_hooks(model_layers: torch.nn.ModuleList) -> tuple[dict, list]:
+    """Register forward hooks on each decoder layer to capture hidden-state statistics."""
+    stats: dict[int, dict] = {}
+
+    def make_hook(idx: int):
+        def hook(module, input, output):
+            hidden = output[0] if isinstance(output, tuple) else output
+            h = hidden.detach().float()
+            stats[idx] = {
+                "abs_max": h.abs().max().item(),
+                "mean": h.mean().item(),
+                "std": h.std().item(),
+                "has_nan": h.isnan().any().item(),
+                "has_inf": h.isinf().any().item(),
+            }
+
+        return hook
+
+    hooks = [layer.register_forward_hook(make_hook(i)) for i, layer in enumerate(model_layers)]
+    return stats, hooks
+
+
+def _log_layer_stats(stats: dict[int, dict], label: str) -> None:
+    logger.info(f"Reference hidden-state stats ({label}):")
+    for i, s in sorted(stats.items()):
+        logger.info(
+            f"  layer {i:2d}: abs_max={s['abs_max']:9.3f}  mean={s['mean']:+.4f}  std={s['std']:.4f}"
+            f"  nan={s['has_nan']}  inf={s['has_inf']}"
+        )
+
+
 def _generate_reference_case_entry(
     *,
     mode: str,
@@ -242,21 +273,33 @@ def _generate_reference_case_entry(
             mask_row[:, :, :position_id] = 0.0
         mask[:, :, :, -1] = 0.0
 
-        with torch.no_grad():
-            model_output = reference_model(
-                torch_input_batch_first,
-                attention_mask=mask,
-                position_ids=position_ids_2d,
-                output_attentions=False,
-                use_cache=True,
-                past_key_values=transformers_cache_from_torch(decode_input_caches),
-            )
+        layer_stats, hooks = _attach_layer_stat_hooks(reference_model.model.layers)
+        try:
+            with torch.no_grad():
+                model_output = reference_model(
+                    torch_input_batch_first,
+                    attention_mask=mask,
+                    position_ids=position_ids_2d,
+                    output_attentions=False,
+                    use_cache=True,
+                    past_key_values=transformers_cache_from_torch(decode_input_caches),
+                )
+        finally:
+            for h in hooks:
+                h.remove()
+        _log_layer_stats(layer_stats, "decode")
         reference_output = model_output.logits.transpose(1, 0).float().cpu()
     else:
         position_ids_or_seq_lens = torch.full((batch_size,), seq_len, dtype=torch.long)
-        hidden_states, _, _ = run_reference_with_attention(
-            reference_model.model, torch_input, position_ids_or_seq_lens, None, hf_config, mode, False
-        )
+        layer_stats, hooks = _attach_layer_stat_hooks(reference_model.model.layers)
+        try:
+            hidden_states, _, _ = run_reference_with_attention(
+                reference_model.model, torch_input, position_ids_or_seq_lens, None, hf_config, mode, False
+            )
+        finally:
+            for h in hooks:
+                h.remove()
+        _log_layer_stats(layer_stats, "prefill")
         with torch.no_grad():
             reference_output = reference_model.lm_head(hidden_states.to(torch.bfloat16)).float().cpu()
         reference_output = reference_output.reshape(1, -1, reference_output.shape[-1])

@@ -901,13 +901,68 @@ class MLA1D(AbstractModule):
 
         attn_out = cls._fwd_decode_flash_mla(tt_q, kvpe_cache, page_table, position_idxs, cfg)
 
+        import os as _os_mla_fo
+
+        if _os_mla_fo.getenv("DEEPSEEK_DEBUG_MLP_FORWARD") == "1":
+            import torch as _torch_mla_fo
+            from loguru import logger as _log_mla_fo
+
+            _mesh_fo = page_table.device()
+            _nr_fo = _mesh_fo.shape[0]
+            # attn_out shape: [1, bsz_local, num_heads, kv_lora_rank] per device
+            # After ConcatMesh2d(dims=(-2,-1)): [1, bsz_local, num_heads*nr, kv_lora_rank*nc]
+            # Use dim 1 (bsz_local) to detect per-row differences via col variation
+            _t_attn = ttnn.to_torch(
+                attn_out,
+                mesh_composer=ttnn.ConcatMesh2dToTensor(_mesh_fo, dims=(1, -1), mesh_shape=tuple(_mesh_fo.shape)),
+            ).float()
+            # dim 1 now has bsz_local * num_rows entries; each row occupies bsz_local consecutive positions
+            _bsz_local_fo = attn_out.shape[1]
+            for _r_fo in range(_nr_fo):
+                _real_attn = _t_attn[:, _r_fo * _bsz_local_fo : _r_fo * _bsz_local_fo + _bsz_local_fo, :, :]
+                _mx_attn = _real_attn.abs().max().item()
+                if _mx_attn > 100 or not _torch_mla_fo.isfinite(_real_attn).all().item():
+                    _log_mla_fo.warning(
+                        f"  MLA attn_out row{_r_fo}: abs_max={_mx_attn:.3e}  finite={_torch_mla_fo.isfinite(_real_attn).all().item()}"
+                    )
+
         # Wkv_b2
 
         v_out = cls._fwd_decode_wkv_b2(attn_out, cfg)
 
+        if _os_mla_fo.getenv("DEEPSEEK_DEBUG_MLP_FORWARD") == "1":
+            _t_vout1 = ttnn.to_torch(
+                v_out,
+                mesh_composer=ttnn.ConcatMesh2dToTensor(_mesh_fo, dims=(1, -1), mesh_shape=tuple(_mesh_fo.shape)),
+            ).float()
+            _bsz_local_v = v_out.shape[1]
+            for _r_fo in range(_nr_fo):
+                _real_v1 = _t_vout1[:, _r_fo * _bsz_local_v : _r_fo * _bsz_local_v + _bsz_local_v, :, :]
+                _mx_v1 = _real_v1.abs().max().item()
+                if _mx_v1 > 100 or not _torch_mla_fo.isfinite(_real_v1).all().item():
+                    _log_mla_fo.warning(
+                        f"  MLA POST-WKV_B2 row{_r_fo}: abs_max={_mx_v1:.3e}  finite={_torch_mla_fo.isfinite(_real_v1).all().item()}"
+                    )
+            _log_mla_fo.debug(f"  MLA POST-WKV_B2 abs_max all rows: {_t_vout1.abs().max().item():.3e}")
+
         # AG + Reshape
 
         v_out = cls._fwd_decode_ag_reshape(v_out, cfg, ccl, bsz, num_heads, v_head_dim)
+
+        if _os_mla_fo.getenv("DEEPSEEK_DEBUG_MLP_FORWARD") == "1":
+            _t_vout2 = ttnn.to_torch(
+                v_out,
+                mesh_composer=ttnn.ConcatMesh2dToTensor(_mesh_fo, dims=(-2, -1), mesh_shape=tuple(_mesh_fo.shape)),
+            ).float()
+            _ss_v2 = _t_vout2.shape[2] // _nr_fo
+            for _r_fo in range(_nr_fo):
+                _real_v2 = _t_vout2[:, :, _r_fo * _ss_v2 : _r_fo * _ss_v2 + 1, :]
+                _mx_v2 = _real_v2.abs().max().item()
+                if _mx_v2 > 100 or not _torch_mla_fo.isfinite(_real_v2).all().item():
+                    _log_mla_fo.warning(
+                        f"  MLA POST-AG_RESHAPE row{_r_fo}: abs_max={_mx_v2:.3e}  finite={_torch_mla_fo.isfinite(_real_v2).all().item()}"
+                    )
+            _log_mla_fo.debug(f"  MLA POST-AG_RESHAPE abs_max all rows: {_t_vout2.abs().max().item():.3e}")
 
         # WO
 
@@ -1105,17 +1160,87 @@ class MLA1D(AbstractModule):
     ) -> tuple[ttnn.Tensor, ttnn.Tensor, ttnn.Tensor]:
         # Fused wq_kv_a matmul
         # 1,1,32,896, width sharded 7x4 [32,32]
+        import os as _os_mla
+
+        if _os_mla.getenv("DEEPSEEK_DEBUG_MLP_FORWARD") == "1":
+            import torch as _torch_mla
+            from loguru import logger as _log_mla
+
+            _mesh_mla = x.device()
+            _nr_mla = _mesh_mla.shape[0]
+            _t_prelin = ttnn.to_torch(
+                x,
+                mesh_composer=ttnn.ConcatMesh2dToTensor(_mesh_mla, dims=(-2, -1), mesh_shape=tuple(_mesh_mla.shape)),
+            ).float()
+            _ss_prelin = _t_prelin.shape[2] // _nr_mla
+            for _r_mla in range(_nr_mla):
+                _real_pre = _t_prelin[:, :, _r_mla * _ss_prelin : _r_mla * _ss_prelin + 1, :]
+                _mx_pre = _real_pre.abs().max().item()
+                if _mx_pre > 100 or not _torch_mla.isfinite(_real_pre).all().item():
+                    _log_mla.warning(
+                        f"  MLA wq_kv_a PRE-LINEAR row{_r_mla}: abs_max={_mx_pre:.3e}  finite={_torch_mla.isfinite(_real_pre).all().item()}"
+                    )
+            _log_mla.debug(f"  MLA wq_kv_a PRE-LINEAR abs_max all rows: {_t_prelin.abs().max().item():.3e}")
+
         tt_q_kv = ttnn.linear(x, **cfg["wq_kv_a"])
         # 1,1,32,2112 (q_lora_rank + kv_lora_rank + qk_rope_head_dim = 1536 + 512 + 64)
+
+        if _os_mla.getenv("DEEPSEEK_DEBUG_MLP_FORWARD") == "1":
+            _t_linear = ttnn.to_torch(
+                tt_q_kv,
+                mesh_composer=ttnn.ConcatMesh2dToTensor(_mesh_mla, dims=(-2, -1), mesh_shape=tuple(_mesh_mla.shape)),
+            ).float()
+            _ss_mla = _t_linear.shape[2] // _nr_mla
+            for _r_mla in range(_nr_mla):
+                _real_lin = _t_linear[:, :, _r_mla * _ss_mla : _r_mla * _ss_mla + 1, :]
+                _mx_lin = _real_lin.abs().max().item()
+                if _mx_lin > 100 or not _torch_mla.isfinite(_real_lin).all().item():
+                    _log_mla.warning(
+                        f"  MLA wq_kv_a POST-LINEAR row{_r_mla}: abs_max={_mx_lin:.3e}  finite={_torch_mla.isfinite(_real_lin).all().item()}"
+                    )
+            _log_mla.debug(f"  MLA wq_kv_a POST-LINEAR abs_max all rows: {_t_linear.abs().max().item():.3e}")
 
         # AR using AG + local reduce (since sub-tile RS not supported for new shapes)
         tt_q_kv = ttnn.experimental.all_gather_async(
             tt_q_kv, **ccl.populate_all_gather_runtime_args(cfg["wq_kv_a_ag_decode"])
         )  # [1, num_devices, bsz, q_lora_rank + kv_lora_rank + qk_rope_head_dim]
+
+        if _os_mla.getenv("DEEPSEEK_DEBUG_MLP_FORWARD") == "1":
+            _t_ag = ttnn.to_torch(
+                tt_q_kv,
+                mesh_composer=ttnn.ConcatMesh2dToTensor(_mesh_mla, dims=(-2, -1), mesh_shape=tuple(_mesh_mla.shape)),
+            ).float()
+            # After AG: shape per device is (1, num_col_devices, bsz, 2112)
+            # After ConcatMesh2d: dim-2 = bsz*4rows, dim-1 = 2112*8cols
+            _ss_ag = _t_ag.shape[2] // _nr_mla
+            for _r_mla in range(_nr_mla):
+                _real_ag = _t_ag[:, :, _r_mla * _ss_ag : _r_mla * _ss_ag + 1, :]
+                _mx_ag = _real_ag.abs().max().item()
+                if _mx_ag > 100 or not _torch_mla.isfinite(_real_ag).all().item():
+                    _log_mla.warning(
+                        f"  MLA wq_kv_a POST-ALLGATHER row{_r_mla}: abs_max={_mx_ag:.3e}  finite={_torch_mla.isfinite(_real_ag).all().item()}"
+                    )
+            _log_mla.debug(f"  MLA wq_kv_a POST-ALLGATHER abs_max all rows: {_t_ag.abs().max().item():.3e}")
+
         tt_q_kv = ttnn.experimental.fast_reduce_nc(
             tt_q_kv,
             **cfg["wq_kv_a_r_decode"],
         )  # [1, 1, bsz, q_lora_rank + kv_lora_rank + qk_rope_head_dim]
+
+        if _os_mla.getenv("DEEPSEEK_DEBUG_MLP_FORWARD") == "1":
+            _t_qkv = ttnn.to_torch(
+                tt_q_kv,
+                mesh_composer=ttnn.ConcatMesh2dToTensor(_mesh_mla, dims=(-2, -1), mesh_shape=tuple(_mesh_mla.shape)),
+            ).float()
+            _ss_mla = _t_qkv.shape[2] // _nr_mla
+            for _r_mla in range(_nr_mla):
+                _real_qkv = _t_qkv[:, :, _r_mla * _ss_mla : _r_mla * _ss_mla + 1, :]
+                _mx_qkv = _real_qkv.abs().max().item()
+                if _mx_qkv > 100 or not _torch_mla.isfinite(_real_qkv).all().item():
+                    _log_mla.warning(
+                        f"  MLA wq_kv_a POST-REDUCE row{_r_mla}: abs_max={_mx_qkv:.3e}  finite={_torch_mla.isfinite(_real_qkv).all().item()}"
+                    )
+            _log_mla.debug(f"  MLA wq_kv_a POST-REDUCE abs_max all rows: {_t_qkv.abs().max().item():.3e}")
 
         # Slice into three parts: tt_q, tt_kv_nope, tt_kv_rope
         tt_q = ttnn.slice(tt_q_kv, [0, 0, 0, 0], [1, 1, bsz, q_lora_rank], **cfg["q_slice_decode"])
