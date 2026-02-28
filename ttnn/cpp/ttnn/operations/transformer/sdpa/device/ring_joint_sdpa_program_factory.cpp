@@ -169,6 +169,12 @@ RingJointSDPAProgramFactory::cached_program_t RingJointSDPAProgramFactory::creat
     const uint32_t DHt = DH / tt::constants::TILE_WIDTH;
     const uint32_t logical_nt = tt::div_up(static_cast<uint32_t>(args.logical_n), tt::constants::TILE_HEIGHT);
 
+    // Lightweight mask is safe only when all padding boundaries are tile-aligned (no partial tiles).
+    // Global N boundary: args.logical_n must be tile-aligned.
+    // Joint L boundary: L must be tile-aligned.
+    // Local N boundary: local_padded_N is always tile-aligned by construction.
+    const bool use_lightweight_mask =
+        (args.logical_n % tt::constants::TILE_HEIGHT == 0) && (L % tt::constants::TILE_HEIGHT == 0);
     /*
     For non-causal case we must provide a padded mask if the K sequence length has been padded
     Note that we dont have this issue in non-causal case if Q is padded, since those pad tokens
@@ -178,6 +184,13 @@ RingJointSDPAProgramFactory::cached_program_t RingJointSDPAProgramFactory::creat
 
     const uint32_t Sq_chunk_t = q_chunk_size / tt::constants::TILE_HEIGHT;
     const uint32_t Sk_chunk_t = k_chunk_size / tt::constants::TILE_HEIGHT;
+
+    log_debug(
+        tt::LogOp,
+        "Ring Joint SDPA: use_lightweight_mask={} (logical_n={}, L={})",
+        use_lightweight_mask,
+        args.logical_n,
+        L);
 
     const uint32_t num_local_q_chunks = tt::div_up(local_padded_N, q_chunk_size);
     const uint32_t num_joint_q_chunks = tt::div_up(L, q_chunk_size);
@@ -397,7 +410,9 @@ RingJointSDPAProgramFactory::cached_program_t RingJointSDPAProgramFactory::creat
         num_q_chunks,
         packed_identity_scalar,
         scale_union.u,
-        args.all_gather_operation_attributes.ring_size};
+        args.all_gather_operation_attributes.ring_size,
+        (std::uint32_t)use_lightweight_mask,
+    };
 
     TensorAccessorArgs(output_tensor.buffer()).append_to(writer_compile_time_args);
     TensorAccessorArgs(joint_output_tensor.buffer()).append_to(writer_compile_time_args);
@@ -434,7 +449,9 @@ RingJointSDPAProgramFactory::cached_program_t RingJointSDPAProgramFactory::creat
         out_in0_num_subblocks,
         out_in1_num_subblocks,
         out_num_blocks,
-        scale_union.u};
+        scale_union.u,
+        (std::uint32_t)use_lightweight_mask,
+    };
 
     std::map<std::string, std::string> defines;
     defines["STATS_GRANULARITY"] = std::to_string(stats_granularity);
@@ -482,7 +499,6 @@ RingJointSDPAProgramFactory::cached_program_t RingJointSDPAProgramFactory::creat
     uint32_t q_tile_size = tt::tile_size(q_df);
     uint32_t k_tile_size = tt::tile_size(k_df);
     uint32_t v_tile_size = tt::tile_size(v_df);
-    uint32_t mask_tile_size = tt::tile_size(mask_df);
     uint32_t out_tile_size = tt::tile_size(out_df);
     uint32_t scalar_tile_size = tt::tile_size(scalar_df);
     uint32_t im_tile_size = tt::tile_size(im_df);
@@ -511,9 +527,13 @@ RingJointSDPAProgramFactory::cached_program_t RingJointSDPAProgramFactory::creat
                             .set_page_size(tt::CBIndex::c_2, v_tile_size);
     CreateCircularBuffer(program, core_grid, c_in2_config);
 
-    // attn_mask input
-    auto c_in3_config = CircularBufferConfig(mask_tiles * mask_tile_size, {{tt::CB::c_in3, mask_df}})
-                            .set_page_size(tt::CB::c_in3, mask_tile_size);
+    // attn_mask input — lightweight mask uses a single Float16_b -inf tile
+    const uint32_t actual_mask_tiles = use_lightweight_mask ? 1 : mask_tiles;
+    const tt::DataFormat actual_mask_df = use_lightweight_mask ? tt::DataFormat::Float16_b : mask_df;
+    const uint32_t actual_mask_tile_size = tt::tile_size(actual_mask_df);
+    auto c_in3_config =
+        CircularBufferConfig(actual_mask_tiles * actual_mask_tile_size, {{tt::CB::c_in3, actual_mask_df}})
+            .set_page_size(tt::CB::c_in3, actual_mask_tile_size);
     CreateCircularBuffer(program, core_grid, c_in3_config);
 
     // scale input

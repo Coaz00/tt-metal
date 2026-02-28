@@ -1312,6 +1312,45 @@ void matmul_reduce(uint32_t in1_cb, const uint32_t& out_cb) {
     }
 }
 
+/**
+ * Lightweight padded-K mask: L1-accumulate a single permanently-fronted -inf tile onto padded
+ * tile positions in out_cb. Runtime version for ring joint SDPA where num_padded varies per chunk.
+ *
+ * @param neginf_cb  CB holding a single permanently-fronted -inf tile
+ * @param out_cb     QK intermediate CB (Sq_chunk_t * Sk_chunk_t tiles, already wait-fronted)
+ * @param num_padded Number of fully padded K tile columns per row
+ * @param num_cols   Total K tiles per row (Sk_chunk_t)
+ * @param num_rows   Q tiles per chunk (Sq_chunk_t)
+ */
+void apply_padded_mask_lightweight_runtime(
+    uint32_t neginf_cb, uint32_t out_cb, uint32_t num_padded, uint32_t num_cols, uint32_t num_rows) {
+    uint32_t start = num_cols - num_padded;
+
+    copy_tile_to_dst_init_short(neginf_cb);
+    cb_wait_front(neginf_cb, 1);
+    PACK((llk_pack_reconfig_l1_acc(1)));
+
+    constexpr uint32_t DST_BATCH = 8;
+    for (uint32_t row = 0; row < num_rows; row++) {
+        uint32_t row_offset = row * num_cols;
+        for (uint32_t base = start; base < num_cols; base += DST_BATCH) {
+            uint32_t batch = (num_cols - base < DST_BATCH) ? (num_cols - base) : DST_BATCH;
+            tile_regs_acquire();
+            for (uint32_t i = 0; i < batch; i++) {
+                copy_tile(neginf_cb, 0, i);  // Always tile 0 — single -inf tile
+            }
+            tile_regs_commit();
+            tile_regs_wait();
+            for (uint32_t i = 0; i < batch; i++) {
+                pack_tile<true>(i, out_cb, row_offset + base + i);
+            }
+            tile_regs_release();
+        }
+    }
+
+    PACK((llk_pack_reconfig_l1_acc(0)));
+}
+
 enum SDPAType {
     STANDARD = 0,
     JOINT = 1,
@@ -1469,7 +1508,11 @@ void sdpa_inner_loop(
     const uint32_t cb_lse_in,
     const uint32_t cb_lse_out,
     const uint32_t cb_prev_out,
-    const uint32_t cb_out) {
+    const uint32_t cb_out,
+    const bool use_lightweight_mask = false,
+    const uint32_t global_n_padded_tiles = 0,
+    const uint32_t local_n_padded_tiles = 0,
+    const uint32_t joint_n_padded_tiles = 0) {
     uint32_t KV_chunks_processed_in_iter = 0;
 
     for (uint32_t q_iter = iter_q_start; q_iter < iter_q_end; ++q_iter) {
@@ -1587,7 +1630,23 @@ void sdpa_inner_loop(
             if (apply_mask) {
                 /* QK += MASK */
                 reconfig_data_format(cb_qk_im, cb_mask_in);
-                add_block_inplace(cb_qk_im, cb_mask_in, qk_chunk_tiles);
+                if (use_lightweight_mask) {
+                    // Lightweight: L1-accumulate single -inf tile onto padded positions
+                    uint32_t num_padded = 0;
+                    if (ring_iter_needs_global_n_mask && k_chunk == global_n_mask_chunk_id) {
+                        num_padded = global_n_padded_tiles;
+                    } else if (local_n_needs_masking && k_chunk == local_n_mask_chunk_id) {
+                        num_padded = local_n_padded_tiles;
+                    } else if (
+                        ring_iter_needs_joint_n_mask && (k_chunk - num_local_k_chunks) == joint_n_mask_chunk_id) {
+                        num_padded = joint_n_padded_tiles;
+                    }
+                    if (num_padded > 0) {
+                        apply_padded_mask_lightweight_runtime(cb_mask_in, cb_qk_im, num_padded, Sk_chunk_t, Sq_chunk_t);
+                    }
+                } else {
+                    add_block_inplace(cb_qk_im, cb_mask_in, qk_chunk_tiles);
+                }
             }
 
             /**
@@ -2121,7 +2180,11 @@ void sdpa_ring(
     const uint32_t cb_lse_in,
     const uint32_t cb_lse_out,
     const uint32_t cb_prev_out,
-    const uint32_t cb_out) {
+    const uint32_t cb_out,
+    const bool use_lightweight_mask = false,
+    const uint32_t global_n_padded_tiles = 0,
+    const uint32_t local_n_padded_tiles = 0,
+    const uint32_t joint_n_padded_tiles = 0) {
     sdpa_inner_loop<
         RING,
         cb_qk_im,
@@ -2192,7 +2255,11 @@ void sdpa_ring(
         cb_lse_in,
         cb_lse_out,
         cb_prev_out,
-        cb_out);
+        cb_out,
+        use_lightweight_mask,
+        global_n_padded_tiles,
+        local_n_padded_tiles,
+        joint_n_padded_tiles);
 }
 
 /**
