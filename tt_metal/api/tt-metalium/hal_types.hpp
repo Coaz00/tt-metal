@@ -39,10 +39,11 @@ enum class HalL1MemAddrType : uint8_t {
     APP_ROUTING_INFO,
     RETRAIN_COUNT,
     RETRAIN_FORCE,
-    CRC_ERR,    // Link status - CRC error count
-    CORR_CW,    // Link status - Corrected Codewords count
-    UNCORR_CW,  // Link status - Uncorrected Codewords count
-    LINK_UP,    // Link status - Link up status
+    CRC_ERR,               // Link status - CRC error count
+    CORR_CW,               // Link status - Corrected Codewords count
+    UNCORR_CW,             // Link status - Uncorrected Codewords count
+    LINK_UP,               // Link status - Link up status
+    LINK_RETRAIN_TRIGGER,  // Trigger a link retrain when written to (1 to trigger)
     FABRIC_TELEMETRY,
     ROUTING_TABLE,
     ROUTER_STATE,

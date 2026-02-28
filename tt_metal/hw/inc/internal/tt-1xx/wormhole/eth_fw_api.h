@@ -8,6 +8,7 @@
 #include <cstdint>
 
 #define MEM_SYSENG_BOOT_RESULTS_BASE 0x1EC0
+#define MEM_SYSENG_ETH_RETRAIN_ADDR 0x1EFC
 
 struct boot_results_t {
     uint32_t reserved_0_4[5];
