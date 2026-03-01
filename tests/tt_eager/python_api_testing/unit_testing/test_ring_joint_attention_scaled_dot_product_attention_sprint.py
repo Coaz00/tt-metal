@@ -53,8 +53,9 @@ GALAXY_DEVICE_COUNT = 32  # Total devices in Galaxy
 GALAXY_TP_SIZE = 4  # Tensor parallel size (number of rings)
 GALAXY_SP_SIZE = 8  # Sequence parallel size (devices per ring)
 
-# Workload configuration constants
-BASE_SEQ_LENS_PER_DEVICE = [2368, 9472]  # Base sequence lengths designed for Galaxy
+# Workload configuration constants - per-device sequence lengths
+GALAXY_SEQ_LENS_PER_DEVICE = [2368, 9472]  # Galaxy per-device sequence lengths (12x10 grid)
+NON_GALAXY_SEQ_LENS_PER_DEVICE = [2080, 8416]
 HEADS_PER_DEVICE = 10  # Number of attention heads per device
 HEAD_DIMENSION = 128  # Attention head dimension
 BATCH_SIZE = 1  # Default batch size
@@ -246,12 +247,12 @@ def generate_input_shapes():
     """
     Generate input shapes based on available devices.
 
-    Per-device targets:
-    - Sequence length per device: 9472 or 2368 (Galaxy) or adjusted for non-Galaxy
-    - Heads per device: 10 (computation per device)
-    - Total heads = 10 × tp_size (devices across TP share same heads)
+    Per-device sequence lengths are hardcoded:
+    - Galaxy: 2368, 9472
+    - Non-Galaxy: 2176, 8640 (tile-aligned)
 
-    For non-Galaxy: sequence length is scaled by *10/11 and TILE aligned
+    Total sequence = per_device * sp_size
+    Total heads = HEADS_PER_DEVICE * tp_size
 
     NOTE: Uses detect_devices_without_opening() to avoid holding device locks
     during pytest collection, which would block subprocess profiling.
@@ -259,34 +260,17 @@ def generate_input_shapes():
     num_devices = detect_devices_without_opening()
     sp_size, tp_size, arch_type = calculate_mesh_config(num_devices)
 
-    # Base sequence lengths per device
-    base_seq_lens_per_device = BASE_SEQ_LENS_PER_DEVICE
-    heads_per_device = HEADS_PER_DEVICE
-
-    # Adjust sequence lengths based on architecture
-    seq_lens_per_device = []
-    for base_seq_len in base_seq_lens_per_device:
-        if arch_type.startswith("galaxy"):
-            # Galaxy uses original sequence lengths (11x10 grid)
-            seq_len_per_device = base_seq_len
-        else:
-            # Non-Galaxy: scale by total columns ratio (10 vs 11 columns total compute capacity)
-            # Base sequence lengths are designed for Galaxy's 11-column capacity
-            scaled_seq_len = int(base_seq_len * (NON_GALAXY_GRID_COLS - 1) / (GALAXY_GRID_COLS - 1))  # 10/11
-            # Ensure TILE alignment (32-boundary for TT-Metal tiles)
-            seq_len_per_device = (
-                (scaled_seq_len + TILE_ALIGNMENT_BOUNDARY - 1) // TILE_ALIGNMENT_BOUNDARY
-            ) * TILE_ALIGNMENT_BOUNDARY
-        seq_lens_per_device.append(seq_len_per_device)
+    if arch_type.startswith("galaxy"):
+        seq_lens_per_device = GALAXY_SEQ_LENS_PER_DEVICE
+    else:
+        seq_lens_per_device = NON_GALAXY_SEQ_LENS_PER_DEVICE
 
     shapes = []
     shape_ids = []
 
     for seq_len_per_device in seq_lens_per_device:
-        # Total sequence = seq_len_per_device * sp_size
         total_seq_len = seq_len_per_device * sp_size
-        # Total heads = heads_per_device * tp_size (TP devices share same heads)
-        total_heads = heads_per_device * tp_size
+        total_heads = HEADS_PER_DEVICE * tp_size
 
         shape = [BATCH_SIZE, total_heads, total_seq_len, HEAD_DIMENSION]
         shapes.append(shape)
