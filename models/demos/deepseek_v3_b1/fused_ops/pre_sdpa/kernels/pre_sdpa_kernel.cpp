@@ -38,6 +38,7 @@
 #include "../../../unified_kernels/broadcast.hpp"
 #include "../../../unified_kernels/kv_cache_update.hpp"
 #include "../../../unified_kernels/flash_mla.hpp"
+#include "../../../micro_ops/flash_mla/kernels/rt_args_common.hpp"
 
 // Compile-time role flags for dead code elimination via if constexpr
 // Defined at namespace scope (local classes cannot have static data members)
@@ -62,6 +63,10 @@ struct Core {
 
     // MLA
     static constexpr bool is_mla_core = get_named_compile_time_arg_val("is_mla_core") == 1;
+
+    // SP-aware KV cache skip
+    static constexpr uint32_t kv_cache_device_chunk_size = get_named_compile_time_arg_val("kv_cache_device_chunk_size");
+    static constexpr uint32_t kv_cache_sp_device_idx = get_named_compile_time_arg_val("kv_cache_sp_device_idx");
 };
 
 void kernel_main() {
@@ -965,53 +970,92 @@ uint32_t per_core_rta_arg_idx = 0;
     }
     {
         // ========================================================================
-        // KV Cache Branch - Matmul
-        // DKV Matmul: 9x2 grid, each core handles 1 head of 32 dim
+        // Determine whether this SP device owns the current position.
+        // When device_chunk_size > 0, only the owning device runs the KV cache
+        // path (DKV matmul → gather → rmsnorm → rope → cache update).
         // ========================================================================
-        {
-            DeviceZoneScopedN("DKV_MATMUL");
-            // pop_in0 = true (consumed), pop_in1 = false (weights are persistent)o
-            deepseek_b1_ops::Matmul::Op<DKV_MatmulCTArgs, Core::is_dkv_matmul_core, false, false> dkv_matmul;
-            dkv_matmul(dkv_matmul_args);
+        bool skip_kv_cache_path = false;
+        if constexpr (Core::kv_cache_device_chunk_size > 0) {
+            uint32_t kv_pos_addr;
+#if defined(COMPILE_FOR_BRISC)
+            kv_pos_addr = get_common_arg_val<uint32_t>(1);
+#elif defined(COMPILE_FOR_NCRISC)
+            kv_pos_addr = get_common_arg_val<uint32_t>(14);
+#elif defined(COMPILE_FOR_TRISC)
+            kv_pos_addr = get_common_arg_val<uint32_t>(7);
+#endif
+            volatile tt_l1_ptr uint32_t* pos_ptr = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(kv_pos_addr);
+            uint32_t cur_pos = pos_ptr[0];
+            skip_kv_cache_path =
+                !device_has_work(cur_pos, Core::kv_cache_sp_device_idx, Core::kv_cache_device_chunk_size);
+        }
+
+        if (!skip_kv_cache_path) {
+            // ====================================================================
+            // KV Cache Branch - Matmul
+            // DKV Matmul: 9x2 grid, each core handles 1 head of 32 dim
+            // ====================================================================
+            {
+                DeviceZoneScopedN("DKV_MATMUL");
+                // pop_in0 = true (consumed), pop_in1 = false (weights are persistent)
+                deepseek_b1_ops::Matmul::Op<DKV_MatmulCTArgs, Core::is_dkv_matmul_core, false, false> dkv_matmul;
+                dkv_matmul(dkv_matmul_args);
+            }
+
+            // ====================================================================
+            // KV Cache Branch: Gather: dkv matmul cores (senders) -> rmsnorm core (receiver)
+            // NCRISC sends from knope grid of dkv matmul cores, BRISC receives on rmsnorm grid, TRISC no-op
+            // ====================================================================
+            {
+                DeviceZoneScopedN("DKV_GATHER");
+                deepseek_b1_ops::Gather::Op<Core::is_knope_core, Core::is_kv_rmsnorm_core, true> dkv_gather;
+                dkv_gather(dkv_gather_args);
+            }
+
+            // ====================================================================
+            // RMSNorm: Apply RMSNorm to the gathered data
+            {
+                DeviceZoneScopedN("KV_RMSNORM");
+                deepseek_b1_ops::RMSNorm::Op<KV_RMSNormCTArgs, Core::is_kv_rmsnorm_core, true> kv_rmsnorm;
+                kv_rmsnorm(kv_rmsnorm_args);
+            }
+            // ====================================================================
+            // KV Cache Branch: RoPE
+            // ====================================================================
+            {
+                DeviceZoneScopedN("K_ROPE");
+                deepseek_b1_ops::Rope::Op<K_RopeCTArgs, Core::is_krope_core> krope;
+                krope(krope_args);
+            }
+            // ====================================================================
+            // KV Cache Update: Write results to DRAM interleaved tensor
+            // BRISC handles writing from output CBs to DRAM
+            // ====================================================================
+            {
+                DeviceZoneScopedN("KV_CACHE_UPDATE");
+                deepseek_b1_ops::KVCacheUpdate::Op<Core::is_kv_rmsnorm_core, Core::is_krope_core> kv_cache_update;
+                kv_cache_update(kv_cache_update_args);
+            }
+        } else {
+            // Position not owned by this SP device — signal the semaphore
+            // so Flash MLA cores can proceed without waiting on the KV cache update.
+#if defined(COMPILE_FOR_BRISC)
+            if constexpr (Core::is_kv_rmsnorm_core || Core::is_krope_core) {
+                constexpr uint8_t MCAST_NOC = 0;
+                uint64_t sem_addr = get_noc_multicast_addr<MCAST_NOC>(
+                    kv_cache_update_args.full_grid_mcast_start_x,
+                    kv_cache_update_args.full_grid_mcast_start_y,
+                    kv_cache_update_args.full_grid_mcast_end_x,
+                    kv_cache_update_args.full_grid_mcast_end_y,
+                    kv_cache_update_args.kv_cache_cur_pos_ready_semaphore_addr);
+                noc_semaphore_inc_multicast(sem_addr, 1, kv_cache_update_args.full_grid_mcast_num_dests, MCAST_NOC);
+                noc_async_atomic_barrier(MCAST_NOC);
+            }
+#endif
         }
 
         // ========================================================================
-        // KV Cache Branch: Gather: dkv matmul cores (senders) -> rmsnorm core (receiver)
-        // NCRISC sends from knope grid of dkv matmul cores, BRISC receives on rmsnorm grid, TRISC no-op
-        // ========================================================================
-        {
-            DeviceZoneScopedN("DKV_GATHER");
-            deepseek_b1_ops::Gather::Op<Core::is_knope_core, Core::is_kv_rmsnorm_core, true> dkv_gather;
-            dkv_gather(dkv_gather_args);
-        }
-
-        // ========================================================================
-        // RMSNorm: Apply RMSNorm to the gathered data
-        {
-            DeviceZoneScopedN("KV_RMSNORM");
-            deepseek_b1_ops::RMSNorm::Op<KV_RMSNormCTArgs, Core::is_kv_rmsnorm_core, true> kv_rmsnorm;
-            kv_rmsnorm(kv_rmsnorm_args);
-        }
-        // ========================================================================
-        // KV Cache Branch: RoPE
-        // ========================================================================
-        {
-            DeviceZoneScopedN("K_ROPE");
-            deepseek_b1_ops::Rope::Op<K_RopeCTArgs, Core::is_krope_core> krope;
-            krope(krope_args);
-        }
-        // ========================================================================
-        // KV Cache Update: Write results to DRAM interleaved tensor
-        // BRISC handles writing from output CBs to DRAM
-        // ========================================================================
-        {
-            DeviceZoneScopedN("KV_CACHE_UPDATE");
-            deepseek_b1_ops::KVCacheUpdate::Op<Core::is_kv_rmsnorm_core, Core::is_krope_core> kv_cache_update;
-            kv_cache_update(kv_cache_update_args);
-        }
-
-        // ========================================================================
-        // Flash MLA: Compute
+        // Flash MLA: Compute (always runs regardless of SP skip)
         // ========================================================================
         {
             DeviceZoneScopedN("FLASH_MLA");

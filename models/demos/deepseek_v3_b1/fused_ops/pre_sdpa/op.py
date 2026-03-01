@@ -1078,6 +1078,8 @@ class PreSDPA:
         ]
 
         # KVCacheUpdate CB indices and krope_Wt passed as runtime args (ReaderArgs/WriterArgs/ComputeArgs)
+        flash_mla_program_config = FlashMLADecode.ProgramConfig()
+        device_chunk_size = flash_mla_program_config.device_chunk_size
         kv_cache_brisc_named_compile_time_args = [
             ("krope_output_cb", krope_output_cb),
             ("kv_cache_output_cb", kv_cache_output_cb),
@@ -1090,17 +1092,21 @@ class PreSDPA:
             ("full_grid_mcast_end_y", mcast_dest_noc_end_core.y),
             ("full_grid_mcast_num_dests", mcast_num_cores - 1),
             ("kv_cache_cur_pos_ready_semaphore_addr", mla_kv_cache_cur_pos_ready_semaphore_addr),
+            ("kv_cache_device_chunk_size", device_chunk_size),
         ]
         kv_cache_trisc_named_compile_time_args = [
             ("kv_rmsnorm_output_cb", kv_rmsnorm_output_cb),
             ("kv_cache_output_cb", kv_cache_output_cb),
             ("kv_cache_input_cb", kv_cache_input_cb),
             ("kv_cache_intermed_cb", kv_cache_intermed_cb),
+            ("kv_cache_device_chunk_size", device_chunk_size),
+        ]
+        kv_cache_ncrisc_named_compile_time_args = [
+            ("kv_cache_device_chunk_size", device_chunk_size),
         ]
 
         # Flash MLA named compile-time args
         # a lot of the setup is reused from the FlashMLADecode op
-        flash_mla_program_config = FlashMLADecode.ProgramConfig()
         k_chunk_size = flash_mla_program_config.k_chunk_size
         num_q_heads_per_core = 8
         k_shape = kv_cache_tensor.padded_shape
@@ -2232,6 +2238,8 @@ class PreSDPA:
                     + dkv_gather_sender_named_compile_time_args
                     + krope_ncrisc_named_compile_time_args
                     + krope_ncrisc_addr_args
+                    + kv_cache_ncrisc_named_compile_time_args
+                    + [("kv_cache_sp_device_idx", row)]
                     + mla_ncrisc_named_compile_time_args
                 )
                 ncrisc_common_runtime_args = ncrisc_bcast_common_args + [
@@ -2252,6 +2260,7 @@ class PreSDPA:
                     + dkv_gather_receiver_named_compile_time_args
                     + kv_rmsnorm_brisc_named_compile_time_args
                     + kv_cache_brisc_named_compile_time_args
+                    + [("kv_cache_sp_device_idx", row)]
                     + mla_brisc_named_compile_time_args
                 )
                 brisc_common_runtime_args = [k_addr, position_ids_tensor_addr]
@@ -2270,6 +2279,7 @@ class PreSDPA:
                     + kv_rmsnorm_trisc_named_compile_time_args
                     + krope_trisc_named_compile_time_args
                     + kv_cache_trisc_named_compile_time_args
+                    + [("kv_cache_sp_device_idx", row)]
                     + mla_trisc_named_compile_time_args
                 )
 
