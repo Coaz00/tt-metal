@@ -74,12 +74,18 @@ class PreSDPA:
             sin_tensor: Sin tensor (torch.Tensor) [max_seq_len, qrope_head_dim]
             cos_tensor: Cos tensor (torch.Tensor) [max_seq_len, qrope_head_dim]
             position_ids: Position indices (torch.Tensor) [batch] for decode mode
-            epsilon: Small value to avoid division by zero
+            dkv_matmul_weights_tensor: DKV matmul weights (torch.Tensor) [K, nope_dim + rope_dim]
+            dkv_rmsnorm_gamma_tensor: DKV RMSNorm gamma (torch.Tensor) [1, nope_dim]
+            kv_cache_tensor: KV cache (torch.Tensor) [1, 1, max_seq_len, nope_dim + rope_dim]
+            scale: Scale factor for FlashMLA
+            epsilon: Small value to avoid division by zero (default 1e-6)
             num_qnope_heads: Number of Qnope heads (default 64)
             num_qrope_heads: Number of Qrope heads (default 64)
             qnope_head_dim: Dimension per Qnope head (default 128)
             qrope_head_dim: Dimension per Qrope head (default 64)
             heads_per_row: Number of heads per grid row (default 8)
+            nope_dim: NOPE dimension / KV nope dim (default 512)
+            rope_dim: RoPE dimension / KV rope dim (default 64)
 
         Returns:
             Tuple of (qnope_output, qrope_output, sdpa_interleaved):

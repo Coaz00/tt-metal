@@ -9,11 +9,48 @@
 
 inline uint32_t nearest_n(uint32_t x, uint32_t n) { return ((x + n - 1) / n) * n; }
 
+// Returns whether this SP device has any work for the given cur_pos.
+// Tokens are assigned in device_chunk_size groups round-robin across SP devices:
+//   [0, dcs) -> dev 0, [dcs, 2*dcs) -> dev 1, ..., [num_sp*dcs, (num_sp+1)*dcs) -> dev 0, ...
+// Device d has work iff the global valid token count exceeds d * device_chunk_size.
+inline bool device_has_work(uint32_t cur_pos, uint32_t sp_device_idx, uint32_t device_chunk_size) {
+    return cur_pos >= sp_device_idx * device_chunk_size;
+}
+
 inline std::tuple<uint32_t, uint32_t, uint32_t> get_runtime_args(
-    int cur_pos, int cur_batch, int core_num, int num_cores_per_batch, uint32_t k_chunk_size) {
-    // No sliding window: process from beginning up to cur_pos
+    int cur_pos,
+    int cur_batch,
+    int core_num,
+    int num_cores_per_batch,
+    uint32_t k_chunk_size,
+    uint32_t device_chunk_size = 0,
+    uint32_t sp_device_idx = 0,
+    uint32_t num_sp_devices = 1) {
+    // Global valid sequence length (rounded up to k_chunk_size)
     uint32_t valid_seq_len = nearest_n(cur_pos + 1, k_chunk_size);
     uint32_t num_chunks_value = valid_seq_len / k_chunk_size;
+
+    // When SP is active, compute local chunk count for this device.
+    // Device-chunk groups of (device_chunk_size / k_chunk_size) chunks are distributed
+    // round-robin across SP devices:
+    //   group 0 -> dev 0, group 1 -> dev 1, ..., group num_sp -> dev 0, ...
+    if (num_sp_devices > 1) {
+        uint32_t chunks_per_dc = device_chunk_size / k_chunk_size;
+        uint32_t total_groups = num_chunks_value / chunks_per_dc;
+        uint32_t remaining_chunks = num_chunks_value % chunks_per_dc;
+
+        uint32_t groups_for_device = total_groups / num_sp_devices;
+        uint32_t extra_group_cutoff = total_groups % num_sp_devices;
+        if (sp_device_idx < extra_group_cutoff) {
+            groups_for_device += 1;
+        }
+
+        num_chunks_value = groups_for_device * chunks_per_dc;
+
+        if (remaining_chunks > 0 && sp_device_idx == extra_group_cutoff) {
+            num_chunks_value += remaining_chunks;
+        }
+    }
 
     uint32_t k_chunk_start = 0;
     uint32_t k_chunk_end = 0;
@@ -31,21 +68,15 @@ inline std::tuple<uint32_t, uint32_t, uint32_t> get_runtime_args(
         k_chunk_end = k_chunk_start + chunks_per_core;
     } else {
         // More chunks than cores: strided distribution
-        // Core N processes chunks: N, N+num_cores, N+2*num_cores, ...
-        // We encode this as: k_chunk_start = first chunk for this core
-        //                    k_chunk_end = k_chunk_start + num_chunks_for_core * num_cores (stride encoded)
-        // But kernel expects contiguous range, so we return stride info differently:
         // k_chunk_start = core_num (first chunk index)
-        // k_chunk_end encodes the count: we'll iterate with stride in the kernel
+        // k_chunk_end = first chunk + (num_chunks - 1) * stride + 1
+        // Kernel iterates: for (k = start; k < end; k += stride)
+        // where stride = num_cores_per_batch
         int chunks_per_core = num_chunks_value / num_cores_per_batch;
         int residuals = num_chunks_value % num_cores_per_batch;
         int num_chunks_for_core = chunks_per_core + (core_num < residuals ? 1 : 0);
 
-        // First chunk for this core
         k_chunk_start = core_num;
-        // k_chunk_end = first chunk + (num_chunks - 1) * stride + 1
-        // This way the kernel can iterate: for (k = start; k < end; k += stride)
-        // where stride = num_cores_per_batch
         k_chunk_end =
             k_chunk_start + (num_chunks_for_core > 0 ? (num_chunks_for_core - 1) * num_cores_per_batch + 1 : 0);
     }

@@ -93,7 +93,8 @@ def test_pre_sdpa(
     shape = (1, 7168)
     matmul_weights_shape = (7168, 1536)
 
-    max_seq_len = 32 * 1024
+    max_seq_len = 128 * 1024
+    per_device_max_seq_len = max_seq_len // mesh_rows
     assert position_id < max_seq_len, f"Position ID {position_id} must be less than max sequence length {max_seq_len}"
 
     # Head configuration
@@ -539,13 +540,12 @@ def test_pre_sdpa(
         k_chunk_size=128,
         exp_approx_mode=False,  # Use exact exp for higher precision
     )
-    logger.info(f"Creating KV cache with seq_len={max_seq_len}...")
+    logger.info(f"Creating KV cache with per-device seq_len={per_device_max_seq_len}, total_seq_len={max_seq_len}...")
     kvpe_dim = KNOPE_DIM + KROPE_DIM
     cache_shape = (1, 1, max_seq_len, kvpe_dim)
-    # from 0 to position id, the kv cache is valid, position_id data is filled by test
+    # from 0 to position_id - 1 the kv cache is valid (position_id is filled by the op)
     torch_kv_cache = torch.zeros(cache_shape, dtype=torch.bfloat16)
-    for i in range(position_id):
-        torch_kv_cache[:, :, i, :] = torch.randn(1, 1, 1, kvpe_dim, dtype=torch.bfloat16)
+    torch_kv_cache[:, :, :position_id, :] = torch.randn(1, 1, position_id, kvpe_dim, dtype=torch.bfloat16)
 
     # ND sharding with ROUND_ROBIN_1D distribution across DRAM banks
     # Each shard = one k_chunk (k_chunk_size x kvpe_dim), distributed round-robin
@@ -573,7 +573,7 @@ def test_pre_sdpa(
         layout=ttnn.TILE_LAYOUT,
         device=submesh,
         memory_config=kv_mem_config,
-        mesh_mapper=ttnn.ReplicateTensorToMesh(submesh),
+        mesh_mapper=ttnn.ShardTensor2dMesh(submesh, mesh_shape=(mesh_rows, mesh_cols), dims=(2, None)),
     )
     kv_cache_bfp8_before_op = ttnn.to_torch(ttnn_kv_cache, mesh_composer=ttnn.ConcatMeshToTensor(submesh, dim=0))
 
@@ -622,92 +622,88 @@ def test_pre_sdpa(
     output_torch = ttnn.to_torch(ttnn_output_result, mesh_composer=ttnn.ConcatMeshToTensor(submesh, dim=0))
 
     # ========================================================================
-    # Compute golden reference
+    # Compute golden reference (once per SP group with its sharded KV cache)
     # ========================================================================
     logger.info("Computing golden reference...")
 
     # Golden uses unshuffled weights (sequential output: all QNOPE, then all QROPE).
     # Full tensor with num_tp * 64 heads; output is split per-TP for comparison.
-    torch_q_expected, torch_kv_cache_expected, torch_output_expected = PreSDPA.golden(
-        torch_input,
-        torch_gamma,
-        torch_matmul_weights,
-        torch_rmsnorm2_gamma,
-        torch_matmul2_weights_full_unshuffled,
-        torch_matmul3_weights,
-        torch_sin,
-        torch_cos,
-        position_ids,
-        torch_dkv_matmul_weights,
-        torch_dkv_rmsnorm_gamma,
-        torch_kv_cache,
-        scale,
-        epsilon=epsilon,
-        num_qnope_heads=total_qnope_heads,
-        num_qrope_heads=total_qrope_heads,
-        qnope_head_dim=QNOPE_HEAD_DIM,
-        qrope_head_dim=QROPE_HEAD_DIM,
-        heads_per_row=HEADS_PER_ROW,
-        nope_dim=KNOPE_DIM,
-        rope_dim=KROPE_DIM,
-    )
+    # Each SP device sees a different KV cache shard, so we run golden per SP group.
+    golden_per_sp = {}
+    for sp_group in range(mesh_rows):
+        sp_start = sp_group * per_device_max_seq_len
+        sp_end = (sp_group + 1) * per_device_max_seq_len
+        sp_kv_cache = torch_kv_cache[:, :, sp_start:sp_end, :]
+
+        sp_q, sp_new_kv, sp_output = PreSDPA.golden(
+            torch_input,
+            torch_gamma,
+            torch_matmul_weights,
+            torch_rmsnorm2_gamma,
+            torch_matmul2_weights_full_unshuffled,
+            torch_matmul3_weights,
+            torch_sin,
+            torch_cos,
+            position_ids,
+            torch_dkv_matmul_weights,
+            torch_dkv_rmsnorm_gamma,
+            sp_kv_cache,
+            scale,
+            epsilon=epsilon,
+            num_qnope_heads=total_qnope_heads,
+            num_qrope_heads=total_qrope_heads,
+            qnope_head_dim=QNOPE_HEAD_DIM,
+            qrope_head_dim=QROPE_HEAD_DIM,
+            heads_per_row=HEADS_PER_ROW,
+            nope_dim=KNOPE_DIM,
+            rope_dim=KROPE_DIM,
+        )
+        golden_per_sp[sp_group] = (sp_q, sp_new_kv, sp_output)
 
     slice_size = sdpa_input_output_shape[0]
     expected_width = KNOPE_DIM  # 512
 
-    # KV Cache is same across devices in 4x2 submesh
-    expected_nope = torch_kv_cache_expected[..., :KNOPE_DIM]
-    expected_rope = torch_kv_cache_expected[..., KNOPE_DIM:]
-
-    sdpa_pcc_by_tp = {}
-    kv_nope_pcc_first = None
-    kv_rope_pcc_first = None
-
     for device_idx in range(mesh_rows * mesh_cols):
         tp_group = device_idx % mesh_cols  # TP group determined by mesh column
+        sp_group = device_idx // mesh_cols  # SP group determined by mesh row
 
-        # ---- KV Cache (fully replicated, no TP) ----
+        torch_q_expected, torch_kv_cache_expected, torch_output_expected = golden_per_sp[sp_group]
+
+        # ---- KV Cache (same pattern as original, but each device has its SP shard) ----
         compare_kv_cache = kv_cache_output_torch[device_idx, ..., position_id, :]
 
-        # check that kv cache for 0 to pos_id -  1 is identical to kv cache before op
-        for i in range(position_id):
-            assert torch.allclose(
-                kv_cache_bfp8_before_op[device_idx, ..., i, :], kv_cache_output_torch[device_idx, ..., i, :], atol=1e-6
-            ), "KV Cache before and after op mismatch"
-        logger.info(f"Device {device_idx} old cache validation passed")
+        # check that kv cache for 0 to pos_id - 1 is identical to kv cache before op
+        assert torch.equal(
+            kv_cache_bfp8_before_op[device_idx, ..., :position_id, :],
+            kv_cache_output_torch[device_idx, ..., :position_id, :],
+        ), "KV Cache before and after op mismatch"
+        logger.info(f"Device {device_idx} (SP={sp_group}) old cache validation passed")
 
         # Check that the new kv cache for pos_id is correct compared to golden
+        expected_nope = torch_kv_cache_expected[..., :KNOPE_DIM]
+        expected_rope = torch_kv_cache_expected[..., KNOPE_DIM:]
         compare_nope = compare_kv_cache[..., :KNOPE_DIM]
         compare_rope = compare_kv_cache[..., KNOPE_DIM:]
 
         nope_max_diff = torch.max(torch.abs(expected_nope - compare_nope)).item()
         nope_mean_diff = torch.mean(torch.abs(expected_nope - compare_nope)).item()
-        logger.info(f"Device {device_idx} KV Cache NOPE: Max diff={nope_max_diff}, Mean diff={nope_mean_diff}")
+        logger.info(
+            f"Device {device_idx} (SP={sp_group}) KV Cache NOPE: "
+            f"Max diff={nope_max_diff}, Mean diff={nope_mean_diff}"
+        )
         nope_passing, nope_pcc = comp_pcc(compare_nope, expected_nope, 0.98)
-        logger.info(f"Device {device_idx} KV Cache NOPE PCC: {nope_pcc}")
-        assert nope_passing, f"Device {device_idx} KV Cache NOPE PCC check failed: {nope_pcc}"
+        logger.info(f"Device {device_idx} (SP={sp_group}) KV Cache NOPE PCC: {nope_pcc}")
+        assert nope_passing, f"Device {device_idx} (SP={sp_group}) KV Cache NOPE PCC check failed: {nope_pcc}"
 
-        if kv_nope_pcc_first is not None:
-            assert nope_pcc == kv_nope_pcc_first, (
-                f"Device {device_idx} KV Cache NOPE PCC mismatch across replicated dim: "
-                f"got {nope_pcc}, expected {kv_nope_pcc_first}"
-            )
-        else:
-            kv_nope_pcc_first = nope_pcc
         rope_max_diff = torch.max(torch.abs(expected_rope - compare_rope)).item()
         rope_mean_diff = torch.mean(torch.abs(expected_rope - compare_rope)).item()
-        logger.info(f"Device {device_idx} KV Cache ROPE: Max diff={rope_max_diff}, Mean diff={rope_mean_diff}")
+        logger.info(
+            f"Device {device_idx} (SP={sp_group}) KV Cache ROPE: "
+            f"Max diff={rope_max_diff}, Mean diff={rope_mean_diff}"
+        )
         rope_passing, rope_pcc = comp_pcc(compare_rope, expected_rope, 0.98)
-        logger.info(f"Device {device_idx} KV Cache ROPE PCC: {rope_pcc}")
-        assert rope_passing, f"Device {device_idx} KV Cache ROPE PCC check failed: {rope_pcc}"
-
-        if kv_rope_pcc_first is not None:
-            assert rope_pcc == kv_rope_pcc_first, (
-                f"Device {device_idx} KV Cache ROPE PCC mismatch across replicated dim: "
-                f"got {rope_pcc}, expected {kv_rope_pcc_first}"
-            )
-        else:
-            kv_rope_pcc_first = rope_pcc
+        logger.info(f"Device {device_idx} (SP={sp_group}) KV Cache ROPE PCC: {rope_pcc}")
+        assert rope_passing, f"Device {device_idx} (SP={sp_group}) KV Cache ROPE PCC check failed: {rope_pcc}"
 
         # ---- PreSDPA Output (TP-sharded: replicated across rows, different across columns) ----
         start = device_idx * slice_size
@@ -722,27 +718,24 @@ def test_pre_sdpa(
 
         if received.shape != torch_output_expected_flat.shape:
             logger.error(
-                f"PreSDPA Output shape mismatch at device {device_idx} (TP={tp_group}): "
+                f"PreSDPA Output shape mismatch at device {device_idx} (TP={tp_group}, SP={sp_group}): "
                 f"got {received.shape}, expected {torch_output_expected_flat.shape}"
             )
             continue
 
         max_diff = torch.max(torch.abs(received - torch_output_expected_flat)).item()
         mean_diff = torch.mean(torch.abs(received - torch_output_expected_flat)).item()
-        logger.info(f"Device {device_idx} (TP={tp_group}) PreSDPA Output: Max diff={max_diff}, Mean diff={mean_diff}")
+        logger.info(
+            f"Device {device_idx} (TP={tp_group}, SP={sp_group}) PreSDPA Output: "
+            f"Max diff={max_diff}, Mean diff={mean_diff}"
+        )
 
-        # Lower PCC threshold due to random weights
+        # Lower PCC threshold due to random weights (no cross-device PCC match with SP: each device has its own golden)
         passing, sdpa_pcc = comp_pcc(torch_output_expected_flat, received, 0.90)
-        logger.info(f"Device {device_idx} (TP={tp_group}) PreSDPA Output PCC: {sdpa_pcc}")
-        assert passing, f"Device {device_idx} (TP={tp_group}) PreSDPA Output PCC check failed: {sdpa_pcc}"
-
-        if tp_group in sdpa_pcc_by_tp:
-            assert sdpa_pcc == sdpa_pcc_by_tp[tp_group], (
-                f"Device {device_idx} (TP={tp_group}) PreSDPA Output PCC mismatch across replicated dim: "
-                f"got {sdpa_pcc}, expected {sdpa_pcc_by_tp[tp_group]}"
-            )
-        else:
-            sdpa_pcc_by_tp[tp_group] = sdpa_pcc
+        logger.info(f"Device {device_idx} (TP={tp_group}, SP={sp_group}) PreSDPA Output PCC: {sdpa_pcc}")
+        assert (
+            passing
+        ), f"Device {device_idx} (TP={tp_group}, SP={sp_group}) PreSDPA Output PCC check failed: {sdpa_pcc}"
 
     logger.info("✓ PreSDPA mesh test passed!")
 
