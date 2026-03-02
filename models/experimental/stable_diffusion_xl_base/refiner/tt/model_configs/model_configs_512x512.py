@@ -863,9 +863,9 @@ class RefinerModelOptimisations512x512(RefinerModelOptimisationsBase, ModelOptim
                 return self.conv_configs["ADB_WDB_WS"]
         if "upsamplers" in conv_path:
             if "up_blocks.0" in conv_path:
-                return self.conv_configs["ABH_128_ADB_WDB_MOVE_BS"]
+                return self.conv_configs["ABH_32_ADB_WDB_BS"]
             elif "up_blocks.1" in conv_path:
-                return self.conv_configs["ABH_256_NO_ADB_WDB_BS"]
+                return self.conv_configs["ABH_64_ADB_WDB_BS"]
             elif "up_blocks.2" in conv_path:
                 return self.conv_configs["ABH_128_ADB_WDB_MOVE_BS"]
         if "up_blocks.0" in conv_path:
