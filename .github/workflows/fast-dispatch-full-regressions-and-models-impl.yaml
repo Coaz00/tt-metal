@@ -194,7 +194,9 @@ jobs:
           # Due to host OOM issues in CI vm, we currently only run llama-1B (on TT-Transformers) in the model matrix.
           run_args: |
             PYTEST_CMD="${{ inputs.enable-ops-recording && 'python -m tracy -r -p --dump-device-data-mid-run -m pytest' || 'pytest' }}"
-            if [[ "${{ matrix.test-config.model }}" == *"ttt"* ]]; then
+            if [[ "${{ matrix.test-config.model }}" == "ttt-mistral-7B-v0.3" ]]; then
+              $PYTEST_CMD --timeout 600 tests/nightly/single_card/tt_transformers -k ${{ matrix.test-config.model }}
+            elif [[ "${{ matrix.test-config.model }}" == *"ttt"* ]]; then
               $PYTEST_CMD tests/nightly/single_card/tt_transformers -k ${{ matrix.test-config.model }}
             elif [[ "${{ matrix.test-config.model }}" == *"qwen25_vl"* ]]; then
               $PYTEST_CMD tests/nightly/single_card/qwen25_vl -k ${{ matrix.test-config.model }}
