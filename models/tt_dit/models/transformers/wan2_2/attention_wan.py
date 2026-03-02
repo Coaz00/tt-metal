@@ -282,12 +282,8 @@ class WanAttention(Module):
         spatial_1BND = ttnn.transformer.concatenate_heads(spatial_BHNE)
         spatial_1BND = ttnn.unsqueeze(spatial_1BND, 0)
 
-        if self.parallel_config.tensor_parallel.factor > 1:
-            # Gather spatial on TP axis before projection
-            spatial_1BND = self.ccl_manager.all_gather_persistent_buffer(
-                spatial_1BND, dim=3, mesh_axis=self.parallel_config.tensor_parallel.mesh_axis
-            )
-
-        spatial_1BND = self.to_out(spatial_1BND, compute_kernel_config=self.mm_compute_kernel_config)
+        spatial_1BND = self.to_out(
+            spatial_1BND, compute_kernel_config=self.mm_compute_kernel_config, parallel_config=self.parallel_config
+        )
 
         return spatial_1BND
