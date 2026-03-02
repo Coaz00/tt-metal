@@ -439,7 +439,7 @@ class LMHeadSampling:
 
             # EH matmul k dimension: concat [h_norm | e_norm] has shape [1, hidden_dim + embedding_dim]
             eh_num_tiles_k = rms_num_tiles * 2  # (int(input_shape[1]) + embedding_dim) // in0_tile.tile_shape[1]
-            eh_mcast_data_size_bytes = eh_num_tiles_k * input_tile_size  # concat buffer size
+            eh_mcast_data_size_bytes = eh_num_tiles_k * rms_tile_size  # concat buffer: 14 packed tiles
 
             # EH matmul DRAM streaming parameters
             eh_projection_tensor_sample = eh_proj_tensors_per_device[0]
@@ -1303,7 +1303,7 @@ class LMHeadSampling:
                     e_gamma_cb_descriptor.format_descriptors[0].page_size = rms_tile_size
 
                     # CB 10: embedding row intermediate (filled by NCRISC DRAM read).
-                    embedding_tile_descriptor = ttnn.TileDescriptor(rms_tile_descriptor)
+                    embedding_tile_descriptor = ttnn.TileDescriptor(rms_interpreted_tile)
                     embedding_cb_format = ttnn.CBFormatDescriptor(
                         buffer_index=embedding_cb,
                         data_format=data_format,
@@ -1317,28 +1317,30 @@ class LMHeadSampling:
                     )
 
                     # CB 15: mcast_eh_src - fused [h_norm|e_norm] on sender core (h_rmsnorm then e_rmsnorm push here; no copy)
-                    mcast_eh_tile_descriptor = ttnn.TileDescriptor(in0_tile)
+                    # Uses packed RMS tile format (7+7=14 tiles of 32x32) matching RMSNorm output format
+                    mcast_eh_tile_descriptor = ttnn.TileDescriptor(rms_interpreted_tile)
                     mcast_eh_src_cb_format = ttnn.CBFormatDescriptor(
                         buffer_index=mcast_eh_src_cb,
                         data_format=data_format,
-                        page_size=input_tile_size,
+                        page_size=rms_tile_size,
                         tile=mcast_eh_tile_descriptor,
                     )
                     mcast_eh_src_cb_descriptor = ttnn.CBDescriptor(
-                        total_size=eh_num_tiles_k * input_tile_size,
+                        total_size=eh_num_tiles_k * rms_tile_size,
                         core_ranges=mcast_sender_core_grid,
                         format_descriptors=[mcast_eh_src_cb_format],
                     )
 
                     # CB 18: mcast_eh_dst - receives concat on all mcast cores (EH matmul in0)
+                    # Must match mcast_eh_src tile format (packed RMS tiles)
                     mcast_eh_dst_cb_format = ttnn.CBFormatDescriptor(
                         buffer_index=mcast_eh_dst_cb,
                         data_format=data_format,
-                        page_size=input_tile_size,
+                        page_size=rms_tile_size,
                         tile=mcast_eh_tile_descriptor,
                     )
                     mcast_eh_dst_cb_descriptor = ttnn.CBDescriptor(
-                        total_size=eh_num_tiles_k * input_tile_size,
+                        total_size=eh_num_tiles_k * rms_tile_size,
                         core_ranges=all_cores,
                         format_descriptors=[mcast_eh_dst_cb_format],
                     )
