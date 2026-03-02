@@ -39,21 +39,20 @@ constexpr uint32_t slice_C = get_compile_time_arg_val(12);
 constexpr uint32_t slice_Wt = get_compile_time_arg_val(13);
 constexpr uint32_t dim = get_compile_time_arg_val(14);
 constexpr uint32_t mm_M_unit_blocks_per_core = get_compile_time_arg_val(15);
-constexpr uint32_t mm_N_full_blocks_per_slice = get_compile_time_arg_val(16);
-constexpr uint32_t mm_block_ht = get_compile_time_arg_val(17);
-constexpr uint32_t mm_cores_y = get_compile_time_arg_val(18);
-constexpr uint32_t N_full_block_wt = get_compile_time_arg_val(19);
-constexpr uint32_t chunk_width_in_tiles = get_compile_time_arg_val(20);
-constexpr uint32_t chunks_per_mm_N_full_block = get_compile_time_arg_val(21);
-constexpr uint32_t slice_Ht_per_core = get_compile_time_arg_val(22);
-constexpr uint32_t slice_Ht = get_compile_time_arg_val(23);
-constexpr uint8_t fabric_mux_num_buffers_per_channel = get_compile_time_arg_val(24);
-constexpr size_t fabric_mux_channel_buffer_size_bytes = get_compile_time_arg_val(25);
-constexpr size_t fabric_mux_status_address = get_compile_time_arg_val(26);
-constexpr size_t fabric_mux_termination_signal_address = get_compile_time_arg_val(27);
-constexpr uint32_t num_mux_clients = get_compile_time_arg_val(28);
+constexpr uint32_t mm_block_ht = get_compile_time_arg_val(16);
+constexpr uint32_t mm_cores_y = get_compile_time_arg_val(17);
+constexpr uint32_t N_full_block_wt = get_compile_time_arg_val(18);
+constexpr uint32_t chunk_width_in_tiles = get_compile_time_arg_val(19);
+constexpr uint32_t chunks_per_mm_N_full_block = get_compile_time_arg_val(20);
+constexpr uint32_t slice_Ht_per_core = get_compile_time_arg_val(21);
+constexpr uint32_t slice_Ht = get_compile_time_arg_val(22);
+constexpr uint8_t fabric_mux_num_buffers_per_channel = get_compile_time_arg_val(23);
+constexpr size_t fabric_mux_channel_buffer_size_bytes = get_compile_time_arg_val(24);
+constexpr size_t fabric_mux_status_address = get_compile_time_arg_val(25);
+constexpr size_t fabric_mux_termination_signal_address = get_compile_time_arg_val(26);
+constexpr uint32_t num_mux_clients = get_compile_time_arg_val(27);
 
-constexpr uint32_t num_ct_args = 29;
+constexpr uint32_t num_ct_args = 28;
 
 constexpr ccl_routing_utils::line_unicast_route_info_t forward_unicast_route_info =
     ccl_routing_utils::get_line_unicast_route_info_from_args<num_ct_args>();
@@ -294,13 +293,14 @@ void kernel_main() {
                                             : 1;
                                     tiles_remaining_in_step -= tiles_to_put_in_current_packet;
 
-                                    // Gather phase: compute tile indices for every slot in this packet,
-                                    // advancing the position tracker for each. In-bounds tiles are
-                                    // always contiguous at the front because slice_row is monotonically
-                                    // non-decreasing, so global_tile_idxs[0..num_in_bounds_tiles - 1] are valid.
+                                    // Gather phase: compute tile indices for every slot in this packet.
+                                    // The reader always advances l1_write_addr regardless of validity,
+                                    // so CB slot i corresponds to iteration tile i. We track first_valid_l1
+                                    // to find the actual L1 address of the first valid tile.
                                     uint32_t global_tile_idxs[num_tiles_to_write_per_packet];
                                     uint32_t slice_tile_idx_first = 0;
                                     uint32_t num_in_bounds_tiles = 0;
+                                    uint32_t first_valid_l1 = l1_read_addr;
                                     for (uint32_t packet_slot = 0; packet_slot < tiles_to_put_in_current_packet;
                                          ++packet_slot) {
                                         const auto [slice_row, slice_col] = coordinates_to_slice_coordinates(
@@ -324,6 +324,7 @@ void kernel_main() {
                                                     slice_Wt,
                                                     input_tensor_Wt);
                                             if (num_in_bounds_tiles == 0) {
+                                                first_valid_l1 = l1_read_addr + packet_slot * page_size;
                                                 slice_tile_idx_first = slice_coordinates_to_slice_tile_index(
                                                     slice_row, slice_col - skip_cols_left, slice_Wt);
                                             }
@@ -367,7 +368,7 @@ void kernel_main() {
                                                     UnicastWriteUpdateMask::DstAddr>(
                                                     &mux_connection_handle,
                                                     pkt_unicast_hdr,
-                                                    l1_read_addr,
+                                                    first_valid_l1,
                                                     NocUnicastCommandHeader{noc_address0});
                                                 break;
                                             }
@@ -380,7 +381,7 @@ void kernel_main() {
                                             const uint32_t output_tile_id = output_tile_id_start + slice_tile_idx_first;
                                             const uint64_t local_noc_addr =
                                                 get_noc_addr(output_tile_id, output_addrgen);
-                                            noc_async_write(l1_read_addr, local_noc_addr, page_size);
+                                            noc_async_write(first_valid_l1, local_noc_addr, page_size);
                                         }
                                     }
                                     l1_read_addr += page_size * tiles_to_put_in_current_packet;

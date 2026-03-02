@@ -32,19 +32,15 @@ constexpr uint32_t slice_C = get_compile_time_arg_val(11);
 constexpr uint32_t slice_Wt = get_compile_time_arg_val(12);
 constexpr uint32_t dim = get_compile_time_arg_val(13);
 constexpr uint32_t mm_M_unit_blocks_per_core = get_compile_time_arg_val(14);
-constexpr uint32_t mm_N_full_blocks_per_slice = get_compile_time_arg_val(15);
-constexpr uint32_t mm_block_ht = get_compile_time_arg_val(16);
-constexpr uint32_t mm_cores_y = get_compile_time_arg_val(17);
-constexpr uint32_t mm_N_full_block_wt = get_compile_time_arg_val(18);
-constexpr uint32_t chunk_width_in_tiles = get_compile_time_arg_val(19);
-constexpr uint32_t chunks_per_mm_N_full_block = get_compile_time_arg_val(20);
-constexpr uint32_t mm_block_wt = get_compile_time_arg_val(21);
-constexpr uint32_t slice_Ht_per_core = get_compile_time_arg_val(22);
-// [23]=fuse_mm_op (via FUSE_MM_OP_SIGNALER define)
-constexpr uint32_t slice_Ht = get_compile_time_arg_val(24);
-// 0 = use computed formula (divisible case); >0 = wait for exactly this many mm blocks per chunk
-// (used when slice_Wt % mm_N_full_block_wt != 0 and the whole row is one chunk)
-constexpr uint32_t mm_blocks_sem_override = get_compile_time_arg_val(25);
+constexpr uint32_t mm_block_ht = get_compile_time_arg_val(15);
+constexpr uint32_t mm_cores_y = get_compile_time_arg_val(16);
+constexpr uint32_t mm_N_full_block_wt = get_compile_time_arg_val(17);
+constexpr uint32_t chunk_width_in_tiles = get_compile_time_arg_val(18);
+constexpr uint32_t chunks_per_mm_N_full_block = get_compile_time_arg_val(19);
+constexpr uint32_t mm_block_wt = get_compile_time_arg_val(20);
+constexpr uint32_t slice_Ht_per_core = get_compile_time_arg_val(21);
+// [22]=fuse_mm_op (via FUSE_MM_OP_SIGNALER define)
+constexpr uint32_t slice_Ht = get_compile_time_arg_val(23);
 
 void kernel_main() {
     ///////////////////////////////////////////////////
@@ -60,8 +56,8 @@ void kernel_main() {
     const uint32_t worker_id = get_arg_val<uint32_t>(arg_idx++);
     const uint32_t num_workers = get_arg_val<uint32_t>(arg_idx++);
 
-    constexpr uint32_t ct_idx = 26;  // [21]=mm_block_wt, [22]=slice_Ht_per_core, [23]=fuse_mm_op (via
-                                     // FUSE_MM_OP_SIGNALER define), [24]=slice_Ht, [25]=mm_blocks_sem_override
+    constexpr uint32_t ct_idx = 24;  // [20]=mm_block_wt, [21]=slice_Ht_per_core, [22]=fuse_mm_op (via
+                                     // FUSE_MM_OP_SIGNALER define), [23]=slice_Ht
 
 #ifdef INPUT_IS_SHARDED
     constexpr uint32_t ct_offset = 7;
@@ -110,7 +106,7 @@ void kernel_main() {
     /**
     Iterate over chunks in the row-major order and reduce-scatter each chunk, one by one.
     In particular, for each chunk, perform a full ring reduce-scatter iteration before going to the next one.
-    Note that each chunk can be composed of multiple pieces if mm_N_full_blocks_per_slice > 1.
+    Note that each chunk can be composed of multiple pieces if actual_mm_N_full_blocks_per_slice > 1.
     */
     ASSERT(dim == 3);      // strided reduce-scatter only supports scattering on dim 3
     ASSERT(slice_C == 1);  // note: this can be relaxed if needed but is omitted to avoid nested loops
@@ -141,17 +137,10 @@ void kernel_main() {
 
 #ifdef FUSE_MM_OP_SIGNALER
                 // Wait for matmul to finish writing the output blocks for this chunk.
-                // Normal case: the matmul signals once per mm_block_wt column-tiles within each
-                // N-full-block, so wait for ceil(effective_chunk_width / mm_block_wt) signals.
-                // Fallback case (mm_blocks_sem_override > 0): slice_Wt was not divisible by the
-                // original mm_N_full_block_wt so the whole row became one chunk.  The matmul still
-                // signals in units of mm_block_wt strided across all N-full-blocks; after
-                // mm_blocks_sem_override signals the entire row (including any partial block) is
-                // guaranteed to be written.  We cannot derive this from effective_chunk_width_in_tiles
-                // because that now spans the full slice_Wt which is larger than one N-full-block.
-                const uint32_t sem_increment = (mm_blocks_sem_override != 0)
-                                                   ? mm_blocks_sem_override
-                                                   : (effective_chunk_width_in_tiles + mm_block_wt - 1) / mm_block_wt;
+                // The matmul signals in a strided pattern: value n means n mm_blocks have been
+                // written in EACH N-full-block, so ceil(effective_chunk_width / mm_block_wt)
+                // signals guarantees all N-full-blocks covering this chunk are ready.
+                const uint32_t sem_increment = (effective_chunk_width_in_tiles + mm_block_wt - 1) / mm_block_wt;
                 mm_sem_target += sem_increment;
                 noc_semaphore_wait_min(reinterpret_cast<volatile tt_l1_ptr uint32_t*>(mm_op_ready_sem), mm_sem_target);
 #endif
@@ -236,14 +225,18 @@ void kernel_main() {
                                     const uint32_t input_tile_id = global_tile_idx + batch_offset;
                                     noc_async_read(
                                         get_noc_addr(input_tile_id, input_tensor_addrgen), l1_write_addr, page_size);
-                                    l1_write_addr += page_size;
                                     if (do_reduce) {
                                         noc_async_read(
                                             get_noc_addr(global_tile_idx, intermediate_tensor_addrgen),
                                             intermediate_l1_write_addr,
                                             page_size);
-                                        intermediate_l1_write_addr += page_size;
                                     }
+                                }
+                                // Always advance: CB position i corresponds to iteration tile i,
+                                // so the writer can find valid tile data at the correct packet slot.
+                                l1_write_addr += page_size;
+                                if (do_reduce) {
+                                    intermediate_l1_write_addr += page_size;
                                 }
 
                                 get_next_tile_coordinates(
