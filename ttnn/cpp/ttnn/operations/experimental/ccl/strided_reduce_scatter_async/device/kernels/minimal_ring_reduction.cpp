@@ -21,9 +21,11 @@ void kernel_main() {
     constexpr uint32_t mm_cores_y = get_compile_time_arg_val(9);
     constexpr uint32_t chunk_width_in_tiles = get_compile_time_arg_val(10);
     constexpr uint32_t chunks_per_mm_N_full_block = get_compile_time_arg_val(11);
+    constexpr uint32_t slice_Wt = get_compile_time_arg_val(12);
     constexpr uint32_t mm_N_full_block_wt = get_compile_time_arg_val(13);
     constexpr uint32_t slice_Ht_per_core = get_compile_time_arg_val(14);
     constexpr uint32_t slice_Ht = get_compile_time_arg_val(15);
+    constexpr uint32_t my_chip_id = get_compile_time_arg_val(16);
 
     uint32_t arg_idx = 0;
     const bool direction = get_arg_val<uint32_t>(arg_idx++);
@@ -47,8 +49,21 @@ void kernel_main() {
                     get_effective_chunk_width_in_tiles(chunk_idx, chunk_width_in_tiles, mm_N_full_block_wt);
                 const uint32_t effective_subchunk_size = current_mm_block_ht * effective_chunk_width_in_tiles;
 
+                // Same slice_idx pattern as the reader, but starting at i=1 (skipping
+                // the read-only i=0 pass that the compute kernel does not participate in).
+                int32_t slice_idx = direction ? my_chip_id - 1 : my_chip_id + 1;
+                slice_idx += direction ? -1 : 1;
                 for (uint32_t i = 1; i < ring_size; i++) {
-                    for (uint32_t chunk_piece_idx = 0; chunk_piece_idx < mm_N_full_blocks_per_slice;
+                    const uint32_t actual_slice_idx = wrap_slice_idx(slice_idx, direction, ring_size);
+                    const uint32_t slice_actual_begin = actual_slice_idx * slice_Wt;
+                    const uint32_t slice_actual_end = slice_actual_begin + slice_Wt;
+                    const uint32_t slice_N_begin = (slice_actual_begin / mm_N_full_block_wt) * mm_N_full_block_wt;
+                    const uint32_t slice_N_end =
+                        ((slice_actual_end + mm_N_full_block_wt - 1) / mm_N_full_block_wt) * mm_N_full_block_wt;
+                    const uint32_t actual_mm_N_full_blocks_per_slice =
+                        (slice_N_end - slice_N_begin) / mm_N_full_block_wt;
+
+                    for (uint32_t chunk_piece_idx = 0; chunk_piece_idx < actual_mm_N_full_blocks_per_slice;
                          chunk_piece_idx++) {
                         uint32_t tile_row_in_mm_M_unit_block = 0;
                         uint32_t chunk_col_in_tiles = 0;
@@ -89,6 +104,7 @@ void kernel_main() {
                             cb_push_back(output_cb, tile_granularity);
                         }
                     }
+                    slice_idx += direction ? -1 : 1;
                 }
             }
         }

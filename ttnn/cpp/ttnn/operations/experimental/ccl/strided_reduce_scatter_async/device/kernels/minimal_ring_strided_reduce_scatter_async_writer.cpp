@@ -248,7 +248,16 @@ void kernel_main() {
                         const uint32_t actual_slice_idx = wrap_slice_idx(slice_idx, direction, ring_size);
                         const uint32_t cb_output_id = i > 0 ? cb_compute_output_id : cb_reader_output_id;
 
-                        for (uint32_t chunk_piece_idx = 0; chunk_piece_idx < mm_N_full_blocks_per_slice;
+                        const uint32_t slice_actual_begin = actual_slice_idx * slice_Wt;
+                        const uint32_t slice_actual_end = slice_actual_begin + slice_Wt;
+                        const uint32_t slice_N_begin = (slice_actual_begin / N_full_block_wt) * N_full_block_wt;
+                        const uint32_t slice_N_end =
+                            ((slice_actual_end + N_full_block_wt - 1) / N_full_block_wt) * N_full_block_wt;
+                        const uint32_t actual_mm_N_full_blocks_per_slice =
+                            (slice_N_end - slice_N_begin) / N_full_block_wt;
+                        const uint32_t skip_cols_left = slice_actual_begin - slice_N_begin;
+
+                        for (uint32_t chunk_piece_idx = 0; chunk_piece_idx < actual_mm_N_full_blocks_per_slice;
                              chunk_piece_idx++) {
                             uint32_t tile_row_in_mm_M_unit_block = 0;
                             uint32_t chunk_col_in_tiles = 0;
@@ -305,13 +314,18 @@ void kernel_main() {
                                             tiles_ht_per_core,
                                             mm_block_ht,
                                             chunk_width_in_tiles);
-                                        if (slice_row < slice_Ht) {
+                                        if (slice_row < slice_Ht && slice_col >= skip_cols_left &&
+                                            slice_col < skip_cols_left + slice_Wt) {
                                             global_tile_idxs[num_in_bounds_tiles] =
                                                 slice_coordinates_to_global_tile_index(
-                                                    slice_row, slice_col, actual_slice_idx, slice_Wt, input_tensor_Wt);
+                                                    slice_row,
+                                                    slice_col - skip_cols_left,
+                                                    actual_slice_idx,
+                                                    slice_Wt,
+                                                    input_tensor_Wt);
                                             if (num_in_bounds_tiles == 0) {
                                                 slice_tile_idx_first = slice_coordinates_to_slice_tile_index(
-                                                    slice_row, slice_col, slice_Wt);
+                                                    slice_row, slice_col - skip_cols_left, slice_Wt);
                                             }
                                             ++num_in_bounds_tiles;
                                         }

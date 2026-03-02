@@ -328,7 +328,8 @@ std::vector<uint32_t> get_ring_reduce_compile_args(
     const uint32_t slice_Wt,
     const uint32_t N_full_block_wt,
     const uint32_t slice_Ht_per_core,
-    const uint32_t slice_Ht) {
+    const uint32_t slice_Ht,
+    const uint32_t my_chip_id) {
     // Strided reduction compile args - include MM blocking parameters
     return {
         input_cb_index,              // [0]  input_cb_id
@@ -347,6 +348,7 @@ std::vector<uint32_t> get_ring_reduce_compile_args(
         N_full_block_wt,             // [13] mm_N_full_block_wt
         slice_Ht_per_core,           // [14] slice_Ht_per_core
         slice_Ht,                    // [15] slice_Ht (unpadded; used for ghost-tile bounds checks)
+        my_chip_id,                  // [16] my_chip_id
     };
 }
 
@@ -805,7 +807,8 @@ StridedReduceScatterProgramArtifacts build_ring_strided_reduce_scatter_async_pro
             slice_Wt,
             mm_N_full_block_wt_val,
             slice_Ht_per_core,
-            slice_Ht);
+            slice_Ht,
+            ring_index);
 
     std::string sender_reduce_kernel_path =
         "ttnn/cpp/ttnn/operations/experimental/ccl/strided_reduce_scatter_async/"
