@@ -156,6 +156,16 @@ class RefinerModelOptimisations512x512(RefinerModelOptimisationsBase, ModelOptim
             act_block_h_override=64,
         )
 
+        self.conv_configs["ADB_WDB_NO_MOVE_WS"] = ttnn.Conv2dConfig(
+            weights_dtype=ttnn.bfloat8_b,
+            shard_layout=ttnn.TensorMemoryLayout.WIDTH_SHARDED,
+            deallocate_activation=False,
+            enable_act_double_buffer=True,
+            enable_weights_double_buffer=True,
+            reshard_if_not_optimal=True,
+            output_layout=ttnn.TILE_LAYOUT,
+        )
+
         # region MATMUL CONFIGS
         self.matmul_versions = {
             "40_cores": {
@@ -819,11 +829,11 @@ class RefinerModelOptimisations512x512(RefinerModelOptimisationsBase, ModelOptim
     def get_conv_config(self, conv_path):
         if "downsamplers" in conv_path:
             if "down_blocks.0" in conv_path:
-                return self.conv_configs["ABH_256_ADB_WDB_BS_NO_MOVE"]
-            elif "down_blocks.1" in conv_path:
                 return self.conv_configs["ABH_128_ADB_WDB_NO_MOVE_BS"]
+            elif "down_blocks.1" in conv_path:
+                return self.conv_configs["ABH_32_ADB_WDB_NO_MOVE_BS"]
             elif "down_blocks.2" in conv_path:
-                return self.conv_configs["ABH_32_ADB_WDB_BS"]
+                return self.conv_configs["ADB_WDB_NO_MOVE_WS"]
         if "down_blocks.0" in conv_path:
             return self.conv_configs["ABH_512_ADB_WDB_BS"]
         if "down_blocks.1" in conv_path:
