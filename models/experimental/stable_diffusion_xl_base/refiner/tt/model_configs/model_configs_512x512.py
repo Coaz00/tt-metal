@@ -156,6 +156,16 @@ class RefinerModelOptimisations512x512(RefinerModelOptimisationsBase, ModelOptim
             act_block_h_override=64,
         )
 
+        self.conv_configs["ADB_WDB_WS"] = ttnn.Conv2dConfig(
+            weights_dtype=ttnn.bfloat8_b,
+            shard_layout=ttnn.TensorMemoryLayout.WIDTH_SHARDED,
+            deallocate_activation=True,
+            enable_act_double_buffer=True,
+            enable_weights_double_buffer=True,
+            reshard_if_not_optimal=True,
+            output_layout=ttnn.TILE_LAYOUT,
+        )
+
         self.conv_configs["ADB_WDB_NO_MOVE_WS"] = ttnn.Conv2dConfig(
             weights_dtype=ttnn.bfloat8_b,
             shard_layout=ttnn.TensorMemoryLayout.WIDTH_SHARDED,
@@ -848,9 +858,9 @@ class RefinerModelOptimisations512x512(RefinerModelOptimisationsBase, ModelOptim
                 return self.conv_configs["ABH_32_ADB_WDB_BS"]
         if "down_blocks.3" in conv_path or "mid_block" in conv_path:
             if "conv1" in conv_path:
-                return self.conv_configs["ABH_32_ADB_WDB_BS"]
+                return self.conv_configs["ADB_WDB_WS"]
             else:
-                return self.conv_configs["ABH_32_ADB_WDB_BS"]
+                return self.conv_configs["ADB_WDB_WS"]
         if "upsamplers" in conv_path:
             if "up_blocks.0" in conv_path:
                 return self.conv_configs["ABH_128_ADB_WDB_MOVE_BS"]
@@ -860,9 +870,9 @@ class RefinerModelOptimisations512x512(RefinerModelOptimisationsBase, ModelOptim
                 return self.conv_configs["ABH_128_ADB_WDB_MOVE_BS"]
         if "up_blocks.0" in conv_path:
             if "conv1" in conv_path:
-                return self.conv_configs["ABH_32_ADB_WDB_BS"]
+                return self.conv_configs["ADB_WDB_WS"]
             else:
-                return self.conv_configs["ABH_32_ADB_WDB_BS"]
+                return self.conv_configs["ADB_WDB_WS"]
         if "up_blocks.1" in conv_path:
             if "conv1" in conv_path:
                 return self.conv_configs["ABH_32_ADB_WDB_BS"]
