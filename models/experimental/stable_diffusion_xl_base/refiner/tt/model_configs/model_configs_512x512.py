@@ -620,6 +620,15 @@ class RefinerModelOptimisations512x512(RefinerModelOptimisationsBase, ModelOptim
 
         self.layernorm_configs = {}
         self.layernorm_configs["1536_mid_config"] = ttnn.LayerNormShardedMultiCoreProgramConfig(
+            compute_with_storage_grid_size=ttnn.CoreCoord(8, 2),
+            subblock_w=3,
+            block_h=1,
+            block_w=6,
+            inplace=False,
+            legacy_reduction=True,
+            legacy_rsqrt=True,
+        )
+        self.layernorm_configs["1536_config"] = ttnn.LayerNormShardedMultiCoreProgramConfig(
             compute_with_storage_grid_size=ttnn.CoreCoord(5, 8),
             subblock_w=5,
             block_h=1,
@@ -628,19 +637,10 @@ class RefinerModelOptimisations512x512(RefinerModelOptimisationsBase, ModelOptim
             legacy_reduction=True,
             legacy_rsqrt=True,
         )
-        self.layernorm_configs["1536_config"] = ttnn.LayerNormShardedMultiCoreProgramConfig(
-            compute_with_storage_grid_size=ttnn.CoreCoord(5, 8),
-            subblock_w=5,
-            block_h=4,
-            block_w=10,
-            inplace=False,
-            legacy_reduction=True,
-            legacy_rsqrt=True,
-        )
         self.layernorm_configs["768_config"] = ttnn.LayerNormShardedMultiCoreProgramConfig(
             compute_with_storage_grid_size=ttnn.CoreCoord(5, 8),
             subblock_w=5,
-            block_h=16,
+            block_h=4,
             block_w=5,
             inplace=False,
             legacy_reduction=True,
