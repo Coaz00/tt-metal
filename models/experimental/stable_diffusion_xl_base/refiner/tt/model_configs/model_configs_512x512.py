@@ -275,7 +275,7 @@ class RefinerModelOptimisations512x512(RefinerModelOptimisationsBase, ModelOptim
                 "2D_TM_LINEAR_768": ttnn.MatmulMultiCoreReuseMultiCastProgramConfig(
                     compute_with_storage_grid_size=(5, 8),
                     in0_block_w=6,
-                    per_core_M=16,
+                    per_core_M=4,
                     per_core_N=5,
                     out_subblock_h=1,
                     out_subblock_w=5,
@@ -285,16 +285,6 @@ class RefinerModelOptimisations512x512(RefinerModelOptimisationsBase, ModelOptim
                 "2D_TM_LINEAR_1536": ttnn.MatmulMultiCoreReuseMultiCastProgramConfig(
                     compute_with_storage_grid_size=(5, 8),
                     in0_block_w=6,
-                    per_core_M=4,
-                    per_core_N=10,
-                    out_subblock_h=1,
-                    out_subblock_w=5,
-                    transpose_mcast=False,
-                    fused_activation=None,
-                ),
-                "2D_TM_LINEAR_1536_MID": ttnn.MatmulMultiCoreReuseMultiCastProgramConfig(
-                    compute_with_storage_grid_size=(5, 8),
-                    in0_block_w=6,
                     per_core_M=1,
                     per_core_N=10,
                     out_subblock_h=1,
@@ -302,10 +292,20 @@ class RefinerModelOptimisations512x512(RefinerModelOptimisationsBase, ModelOptim
                     transpose_mcast=False,
                     fused_activation=None,
                 ),
+                "2D_TM_LINEAR_1536_MID": ttnn.MatmulMultiCoreReuseMultiCastProgramConfig(
+                    compute_with_storage_grid_size=(8, 2),
+                    in0_block_w=6,
+                    per_core_M=1,
+                    per_core_N=6,
+                    out_subblock_h=1,
+                    out_subblock_w=3,
+                    transpose_mcast=False,
+                    fused_activation=None,
+                ),
                 "2D_TM_OUT_LINEAR_768": ttnn.MatmulMultiCoreReuseMultiCastProgramConfig(
                     compute_with_storage_grid_size=(5, 8),
                     in0_block_w=1,
-                    per_core_M=16,
+                    per_core_M=4,
                     per_core_N=5,
                     out_subblock_h=1,
                     out_subblock_w=5,
@@ -315,20 +315,20 @@ class RefinerModelOptimisations512x512(RefinerModelOptimisationsBase, ModelOptim
                 "2D_TM_OUT_LINEAR_1536": ttnn.MatmulMultiCoreReuseMultiCastProgramConfig(
                     compute_with_storage_grid_size=(5, 8),
                     in0_block_w=2,
-                    per_core_M=4,
+                    per_core_M=1,
                     per_core_N=10,
-                    out_subblock_h=4,
+                    out_subblock_h=1,
                     out_subblock_w=2,
                     transpose_mcast=False,
                     fused_activation=None,
                 ),
                 "2D_TM_OUT_LINEAR_1536_MID": ttnn.MatmulMultiCoreReuseMultiCastProgramConfig(
-                    compute_with_storage_grid_size=(5, 8),
+                    compute_with_storage_grid_size=(8, 2),
                     in0_block_w=2,
                     per_core_M=1,
-                    per_core_N=10,
+                    per_core_N=6,
                     out_subblock_h=1,
-                    out_subblock_w=5,
+                    out_subblock_w=3,
                     transpose_mcast=False,
                     fused_activation=None,
                 ),
@@ -901,6 +901,8 @@ class RefinerModelOptimisations512x512(RefinerModelOptimisationsBase, ModelOptim
         return self.conv_output_dtype
 
     def _get_groupnorm_config(self, module_path):
+        if "mid_block" in module_path:
+            return self.groupnorm_configs["DRAM_GROUPNORM_2X8"]
         if "up_blocks.3" in module_path and "resnets.0" not in module_path and "norm1" in module_path:
             return self.groupnorm_configs["SHARDED_GROUPNORM_INPLACE_NEGATIVE"]
         if "resnets" in module_path:
